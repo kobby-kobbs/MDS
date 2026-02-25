@@ -144,6 +144,33 @@ def _download_via_sdk(model, version, out_dir):
 
 # -- Shared upload helpers --------------------------------------------------------
 
+def _finalize_staged(session_id, start_time):
+    """Call /upload/complete with retry logic and long timeout."""
+    print(f"  Finalizing (registering model in registry)...")
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(f"{BASE_URL}/upload/complete", json={"session_id": session_id},
+                              headers=_headers(), timeout=300)
+            r.raise_for_status(); data = r.json()
+            elapsed = time.time() - start_time
+            print(f"  Status: {data.get('status','?')}  Model: {data.get('model','?')} v{data.get('version','?')}")
+            print(f"  Blobs: {data.get('blobs_registered','?')}  Total time: {elapsed:.1f}s")
+            return
+        except requests.exceptions.ReadTimeout:
+            if attempt < 3:
+                print(f"  [retry {attempt}/3] Server still processing, retrying in 10s...")
+                time.sleep(10)
+            else:
+                print(f"  [WARN] Server timed out on registry write. Files are in blob storage.")
+                print(f"  You can retry: POST {BASE_URL}/upload/complete {{\"session_id\": \"{session_id}\"}}")
+        except Exception as e:
+            if attempt < 3:
+                print(f"  [retry {attempt}/3] {e}")
+                time.sleep(5)
+            else:
+                print(f"  [ERROR] Finalize failed: {e}")
+                print(f"  Files are in blob. Retry: POST {BASE_URL}/upload/complete {{\"session_id\": \"{session_id}\"}}")
+
 def _collect_files(source):
     source = Path(source)
     if not source.exists(): print(f"[ERROR] Not found: {source}"); sys.exit(1)
@@ -225,16 +252,12 @@ def _do_staged_upload(model_name, source, task=None, device=None, description=No
     if result.returncode != 0:
         print(f"  [ERROR] azcopy failed (exit code {result.returncode})"); return
     print(f"  azcopy transfer done in {elapsed:.1f}s ({_human(total_size / elapsed if elapsed > 0 else 0)}/s)")
-    print(f"  Finalizing upload...")
-    r = requests.post(f"{BASE_URL}/upload/complete", json={"session_id": sid}, headers=_headers(), timeout=60)
-    r.raise_for_status(); data = r.json()
-    total_elapsed = time.time() - start
-    print(f"  Status: {data.get('status','?')}  Model: {data.get('model','?')} v{data.get('version','?')}")
-    print(f"  Total time: {total_elapsed:.1f}s")
+    _finalize_staged(sid, start)
 
 def _do_staged_upload_sdk(model_name, source, task=None, device=None, description=None):
-    """Staged upload using Azure SDK -- parallel, direct-to-blob, no azcopy needed."""
+    """Staged upload using Azure SDK -- parallel block staging for speed."""
     from urllib.parse import urlparse
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     pairs = _collect_files(source)
     total_size = sum(p.stat().st_size for _, p in pairs)
     body = {"model_name": model_name}
@@ -254,78 +277,90 @@ def _do_staged_upload_sdk(model_name, source, task=None, device=None, descriptio
     container = parsed.path.strip("/").split("/")[0]
     sas_token = parsed.query
     from azure.storage.blob import BlobServiceClient, BlobBlock
-    import uuid
+    import uuid, threading
     blob_svc = BlobServiceClient(account_url=account_url, credential=sas_token)
     container_client = blob_svc.get_container_client(container)
     start = time.time()
     uploaded_bytes = 0
-    BLOCK_SIZE = 8 * 1024 * 1024  # 8 MB blocks
-    MAX_RETRIES = 3
+    lock = threading.Lock()
+    BLOCK_SIZE = 4 * 1024 * 1024  # 4 MB blocks (smaller = more parallelism)
+    WORKERS = 8  # concurrent block uploads
 
-    def _stage_with_retry(blob_client, block_id, data, length):
-        for attempt in range(1, MAX_RETRIES + 1):
+    def _upload_small(blob_client, p, fsize):
+        """Small file: single put with retry."""
+        for attempt in range(3):
             try:
-                blob_client.stage_block(block_id, data, length=length)
+                with open(p, "rb") as fh:
+                    blob_client.upload_blob(fh, length=fsize, overwrite=True, blob_type="BlockBlob")
                 return
             except Exception as e:
-                if attempt == MAX_RETRIES:
-                    raise
-                print(f"\n  [retry {attempt}/{MAX_RETRIES}] block failed: {e}")
+                if attempt == 2: raise
                 time.sleep(2 ** attempt)
-                data.seek(0) if hasattr(data, 'seek') else None
 
-    def _upload_one(i, rel, p, prev_bytes):
-        """Upload a single file using staged blocks with real progress tracking."""
+    def _upload_large_parallel(i, blob_client, p, fsize, prev_bytes):
+        """Large file: parallel block staging with live progress."""
+        # Read all blocks first
+        blocks = []
+        with open(p, "rb") as fh:
+            while True:
+                chunk = fh.read(BLOCK_SIZE)
+                if not chunk: break
+                bid = str(uuid.uuid4())
+                blocks.append((bid, chunk))
+        staged_ids = []
+        completed_bytes = 0
+        file_t0 = time.time()
+
+        def _stage_block(bid, data):
+            for attempt in range(3):
+                try:
+                    blob_client.stage_block(bid, io.BytesIO(data), length=len(data))
+                    return bid, len(data)
+                except Exception as e:
+                    if attempt == 2: raise
+                    time.sleep(2 ** attempt)
+
+        with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+            futures = {pool.submit(_stage_block, bid, data): bid for bid, data in blocks}
+            for future in as_completed(futures):
+                bid, nbytes = future.result()
+                staged_ids.append(bid)
+                with lock:
+                    nonlocal uploaded_bytes
+                    completed_bytes += nbytes
+                    done_total = prev_bytes + completed_bytes
+                    elapsed_file = time.time() - file_t0
+                    speed = _human(completed_bytes / elapsed_file) + "/s" if elapsed_file > 0.1 else "---"
+                    pct_file = completed_bytes * 100 // fsize
+                    pct_total = done_total * 100 // total_size if total_size else 100
+                    bar = "#" * (pct_file // 5) + "-" * (20 - pct_file // 5)
+                    print(f"\r  [{i}/{len(pairs)}] [{bar}] {pct_file:>3}% "
+                          f"{_human(completed_bytes)}/{_human(fsize)} @ {speed} "
+                          f"(total {pct_total}%)   ", end="", flush=True)
+        # Commit in original order
+        ordered = [BlobBlock(block_id=bid) for bid, _ in blocks]
+        blob_client.commit_block_list(ordered)
+        elapsed_file = time.time() - file_t0
+        speed = _human(fsize / elapsed_file) + "/s" if elapsed_file > 0 else "?"
+        print(f"\r  [{i}/{len(pairs)}] {p.name:<35} {_human(fsize):>10}  done in {elapsed_file:.1f}s  ({speed})")
+        return fsize
+
+    for i, (rel, p) in enumerate(pairs, 1):
         fsize = p.stat().st_size
         blob_name = f"{prefix}/{rel}".replace("\\", "/")
         blob_client = container_client.get_blob_client(blob_name)
         if fsize <= BLOCK_SIZE:
-            with open(p, "rb") as fh:
-                blob_client.upload_blob(fh, length=fsize, overwrite=True, blob_type="BlockBlob")
-            done = prev_bytes + fsize
-            pct = done * 100 // total_size if total_size else 100
+            _upload_small(blob_client, p, fsize)
+            uploaded_bytes += fsize
             elapsed = time.time() - start
-            speed = _human(done / elapsed) + "/s" if elapsed > 0.1 else "---"
+            speed = _human(uploaded_bytes / elapsed) + "/s" if elapsed > 0.1 else "---"
+            pct = uploaded_bytes * 100 // total_size if total_size else 100
             print(f"  [{i}/{len(pairs)}] {rel:<35} {_human(fsize):>10}  done  (total {pct}% @ {speed})")
-            return fsize
-        # Large file: manual block staging with per-block progress + retry
-        block_ids = []
-        sent = 0
-        file_t0 = time.time()
-        with open(p, "rb") as fh:
-            while True:
-                chunk = fh.read(BLOCK_SIZE)
-                if not chunk:
-                    break
-                block_id = str(uuid.uuid4())
-                _stage_with_retry(blob_client, block_id, io.BytesIO(chunk), len(chunk))
-                block_ids.append(BlobBlock(block_id=block_id))
-                sent += len(chunk)
-                done = prev_bytes + sent
-                elapsed_file = time.time() - file_t0
-                speed = _human(sent / elapsed_file) + "/s" if elapsed_file > 0.1 else "---"
-                pct_file = sent * 100 // fsize
-                pct_total = done * 100 // total_size if total_size else 100
-                bar = "#" * (pct_file // 5) + "-" * (20 - pct_file // 5)
-                print(f"\r  [{i}/{len(pairs)}] [{bar}] {pct_file:>3}% "
-                      f"{_human(sent)}/{_human(fsize)} @ {speed} "
-                      f"(total {pct_total}%)   ", end="", flush=True)
-        blob_client.commit_block_list(block_ids)
-        elapsed_file = time.time() - file_t0
-        speed = _human(fsize / elapsed_file) + "/s" if elapsed_file > 0 else "?"
-        print(f"\r  [{i}/{len(pairs)}] {rel:<35} {_human(fsize):>10}  done in {elapsed_file:.1f}s  ({speed})")
-        return fsize
-
-    for i, (rel, p) in enumerate(pairs, 1):
-        uploaded_bytes += _upload_one(i, rel, p, uploaded_bytes)
+        else:
+            uploaded_bytes += _upload_large_parallel(i, blob_client, p, fsize, uploaded_bytes)
     elapsed = time.time() - start
     print(f"  Upload done in {elapsed:.1f}s ({_human(total_size / elapsed if elapsed > 0 else 0)}/s)")
-    print(f"  Finalizing...")
-    r = requests.post(f"{BASE_URL}/upload/complete", json={"session_id": sid}, headers=_headers(), timeout=60)
-    r.raise_for_status(); data = r.json()
-    total_elapsed = time.time() - start
-    print(f"  Status: {data.get('status','?')}  Model: {data.get('model','?')} v{data.get('version','?')}")
-    print(f"  Total time: {total_elapsed:.1f}s")
+    _finalize_staged(sid, start)
 
 # -- CLI commands -----------------------------------------------------------------
 

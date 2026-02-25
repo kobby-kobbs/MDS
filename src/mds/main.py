@@ -81,14 +81,23 @@ def _build_upload_tags(claims: dict, auto_tags: dict, **ov) -> dict:
 
 
 def _register_model(model_name: str, description: str, tags: dict, *, customer_id: str = None) -> str:
+    ml, _ = _client_for(customer_id)
     temp = UPLOAD_DIR / f"placeholder_{model_name}.txt"
     temp.write_text(f"Model: {model_name}")
     try:
-        m = Model(path=str(temp), name=model_name, type="custom_model", description=description, tags=tags)
-        ml, _ = _client_for(customer_id)
-        reg = ml.models.create_or_update(m)
-        _invalidate_model_caches()
-        return str(reg.version)
+        for attempt in range(1, 4):
+            try:
+                m = Model(path=str(temp), name=model_name, type="custom_model",
+                          description=description, tags=tags)
+                reg = ml.models.create_or_update(m)
+                _invalidate_model_caches()
+                return str(reg.version)
+            except Exception as e:
+                if attempt < 3:
+                    log.warning(f"Registry write attempt {attempt}/3 failed: {e}")
+                    import time as _t; _t.sleep(2 ** attempt)
+                else:
+                    raise
     finally:
         temp.unlink(missing_ok=True)
 
