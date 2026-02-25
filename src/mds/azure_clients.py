@@ -144,6 +144,23 @@ def list_blobs(prefix: str, *, storage_account: str | None = None) -> list[str]:
     return [b.name for b in container.list_blobs(name_starts_with=prefix)]
 
 
+def list_blob_prefixes(*, storage_account: str | None = None) -> dict[str, list[str]]:
+    """List all top-level model prefixes in blob storage.
+
+    Returns dict mapping model_name -> list of version prefixes (e.g. {"mnist": ["v1","v2"]}).
+    Blob structure: <model_name>/v<N>/...
+    """
+    acct = storage_account or STORAGE_ACCOUNT
+    container = get_blob_client(acct).get_container_client(STORAGE_CONTAINER)
+    models: dict[str, set[str]] = {}
+    for blob in container.list_blobs():
+        parts = blob.name.split("/", 2)
+        if len(parts) >= 2:
+            name, ver = parts[0], parts[1]
+            models.setdefault(name, set()).add(ver)
+    return {k: sorted(v) for k, v in models.items()}
+
+
 def download_blob(blob_name: str, *, storage_account: str | None = None) -> bytes:
     """Download blob content as bytes."""
     acct = storage_account or STORAGE_ACCOUNT

@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from .auth import check_entitlement, require_auth
 from .azure_clients import (REGISTRY_NAME, STORAGE_ACCOUNT, download_blob, generate_sas_url,
-                             generate_upload_sas_url, get_ml_client, list_blobs, upload_to_blob)
+                             generate_upload_sas_url, get_ml_client, list_blob_prefixes, list_blobs, upload_to_blob)
 from .catalog import CatalogRequest, build_foundry_model, decode_continuation_token, encode_continuation_token
 from .customers import get_customer_registry, get_customer_storage
 from .metadata import extract_onnx_metadata
@@ -158,6 +158,43 @@ def list_models():
         "registry": REGISTRY_NAME,
         "models": [{"name": m.name, "latest_version": m.latest_version} for m in get_ml_client().models.list()],
     })
+
+
+@app.get("/models/sync")
+def sync_models(authorization: str = Header(...)):
+    """Cross-reference registry with blob storage. Shows models that are:
+    - in registry and blob (healthy)
+    - in blob only (upload succeeded but registration failed)
+    - in registry only (blobs missing or deleted)
+    """
+    claims = require_auth(authorization)
+    cid = claims["customer_id"]
+    ml, sa = _client_for(cid)
+    registry_models = {}
+    for m in ml.models.list():
+        registry_models[m.name] = {"latest_version": m.latest_version}
+    blob_models = list_blob_prefixes(storage_account=sa)
+    all_names = sorted(set(registry_models) | set(blob_models))
+    results = []
+    for name in all_names:
+        in_reg = name in registry_models
+        in_blob = name in blob_models
+        entry = {"name": name, "in_registry": in_reg, "in_blob": in_blob}
+        if in_reg:
+            entry["latest_version"] = registry_models[name]["latest_version"]
+        if in_blob:
+            entry["blob_versions"] = blob_models[name]
+        if in_reg and in_blob:
+            entry["status"] = "synced"
+        elif in_blob:
+            entry["status"] = "blob_only"
+        else:
+            entry["status"] = "registry_only"
+        results.append(entry)
+    counts = {"synced": sum(1 for r in results if r["status"] == "synced"),
+              "blob_only": sum(1 for r in results if r["status"] == "blob_only"),
+              "registry_only": sum(1 for r in results if r["status"] == "registry_only")}
+    return {"total": len(results), "counts": counts, "models": results}
 
 
 @app.post("/download")

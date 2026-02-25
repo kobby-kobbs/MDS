@@ -370,6 +370,20 @@ def cmd_list(_):
     print(f"\nRegistry: {data.get('registry','?')}  ({len(models)} models)")
     for m in models: print(f"  {m['name']:<40} v{m['latest_version']}")
 
+def cmd_sync(_):
+    r = requests.get(f"{BASE_URL}/models/sync", headers=_headers(), timeout=60)
+    r.raise_for_status(); data = r.json()
+    counts = data.get("counts", {})
+    print(f"\nModel Sync Report  ({data.get('total',0)} models)")
+    print(f"  Synced: {counts.get('synced',0)}  Blob-only: {counts.get('blob_only',0)}  Registry-only: {counts.get('registry_only',0)}")
+    print()
+    for m in data.get("models", []):
+        status = m["status"]
+        tag = {"synced": "OK", "blob_only": "BLOB", "registry_only": "REG"}[status]
+        ver = m.get("latest_version", "")
+        blob_vers = ",".join(m.get("blob_versions", []))
+        print(f"  [{tag:>4}] {m['name']:<35} reg={f'v{ver}' if ver else '-':<6} blob=[{blob_vers}]")
+
 def cmd_info(args):
     params = {"version": args.version} if args.version else {}
     r = requests.get(f"{BASE_URL}/models/{args.model_name}", params=params, headers=_headers(), timeout=30)
@@ -490,10 +504,11 @@ def _interactive():
     while True:
         print(f"\n{'- '*30}\n  Step 3: Choose action\n{'- '*30}")
         idx, _ = _pick("Action", ["Download a model", "Upload a model", "View model details",
-                                   "Foundry Local catalog", "Refresh", "Exit"])
+                                   "Foundry Local catalog", "Sync report", "Refresh", "Exit"])
         try:
-            if idx == 6: print("\n  Goodbye!"); break
-            elif idx == 5: models, reg = _fetch_models(); _show_models(models, reg)
+            if idx == 7: print("\n  Goodbye!"); break
+            elif idx == 6: models, reg = _fetch_models(); _show_models(models, reg)
+            elif idx == 5: cmd_sync(None)
             elif idx == 4: cmd_catalog(argparse.Namespace(page_size=50))
             elif idx == 3:
                 _, name = _pick("Model", [m["name"] for m in models]) if models else (0, input("  Model name: ").strip())
@@ -586,6 +601,7 @@ def main():
     p.add_argument("--base-url", default=BASE_URL, help="MDS server URL")
     sub = p.add_subparsers(dest="command")
     sub.add_parser("list", help="List models")
+    sub.add_parser("sync", help="Sync report: registry vs blob")
     ip = sub.add_parser("info", help="Model detail"); ip.add_argument("model_name"); ip.add_argument("--version", "-v", default=None)
     cp = sub.add_parser("catalog", help="Foundry Local catalog"); cp.add_argument("--page-size", type=int, default=50)
     dp = sub.add_parser("download", help="Download model"); dp.add_argument("model_name")
@@ -601,7 +617,7 @@ def main():
     args = p.parse_args()
     if args.base_url != BASE_URL: _set_base_url(args.base_url)
     if not args.command: _interactive(); return
-    cmds = {"list": cmd_list, "info": cmd_info, "catalog": cmd_catalog,
+    cmds = {"list": cmd_list, "sync": cmd_sync, "info": cmd_info, "catalog": cmd_catalog,
             "download": cmd_download, "upload": cmd_upload, "upload-staged": cmd_upload_staged}
     try: cmds[args.command](args)
     except requests.HTTPError as e: print(f"\n[ERROR] HTTP {e.response.status_code}: {e.response.text[:300]}"); sys.exit(1)
