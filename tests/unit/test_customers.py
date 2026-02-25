@@ -5,7 +5,7 @@ from unittest.mock import patch, MagicMock
 
 from mds.customers import (
     CUSTOMERS, get_public_key, get_customer_by_issuer,
-    get_customer_registry, get_customer_storage,
+    get_customer_by_api_key, get_customer_registry, get_customer_storage,
 )
 
 
@@ -37,6 +37,24 @@ class TestGetCustomerByIssuer:
 
     def test_none_issuer(self):
         assert get_customer_by_issuer(None) is None
+
+
+class TestGetCustomerByApiKey:
+    def test_no_key(self):
+        assert get_customer_by_api_key("") is None
+        assert get_customer_by_api_key(None) is None
+
+    def test_unknown_key(self):
+        assert get_customer_by_api_key("random-key-that-doesnt-exist") is None
+
+    def test_matching_key(self):
+        with patch.dict(CUSTOMERS, {"t": {"api_key": "secret-123", "models": ["*"], "sub": "t"}}):
+            assert get_customer_by_api_key("secret-123") == "t"
+
+    def test_empty_api_key_in_config_not_matched(self):
+        """Customers without api_key set should not match empty strings."""
+        with patch.dict(CUSTOMERS, {"t": {"api_key": "", "models": ["*"], "sub": "t"}}):
+            assert get_customer_by_api_key("") is None
 
 
 class TestGetPublicKey:

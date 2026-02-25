@@ -12,6 +12,7 @@ $APP_SERVICE_PLAN     = "mds-app-plan"
 $WEB_APP_NAME         = "mds-model-distribution"
 $REGISTRY_NAME        = "customer-phone"
 $STORAGE_ACCOUNT      = "customermodelstorage"
+$PHONEPE_API_KEY      = "ZLLuYBudNgeUQCHUTmqt_W_M1TSJC-KVozKMh9Ozr-Q"
 
 # ============================================================
 # STEP 1: Check Azure login
@@ -76,7 +77,8 @@ az webapp config appsettings set `
         SCM_DO_BUILD_DURING_DEPLOYMENT=true `
         WEBSITES_PORT=8000 `
         WEBSITES_CONTAINER_START_TIME_LIMIT=600 `
-        CUSTOMER_PHONEPE_JWKS_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/jwks/jwks.json"
+        CUSTOMER_PHONEPE_JWKS_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/jwks/jwks.json" `
+        CUSTOMER_PHONEPE_API_KEY=$PHONEPE_API_KEY
 
 Write-Host "Environment variables configured" -ForegroundColor Green
 

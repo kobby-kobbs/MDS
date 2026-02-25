@@ -25,6 +25,15 @@ class CatalogRequest(BaseModel):
     indexEntitiesRequest: Optional[IndexEntitiesRequest] = None
 
 
+class FLCatalogQuery(BaseModel):
+    """Query parameters for the /catalog/fl endpoint."""
+    task: Optional[str] = None          # filter by task (chat-completion, text-generation, etc.)
+    device: Optional[str] = None        # filter by device (cpu, npu, gpu)
+    modality: Optional[str] = None      # filter by inputModalities
+    pageSize: Optional[int] = 50
+    continuationToken: Optional[str] = None
+
+
 # Pagination helpers
 
 
@@ -43,30 +52,35 @@ def decode_continuation_token(token: str) -> tuple[int, int]:
         return 0, 100
 
 
-def build_foundry_model(model_info, tags: dict) -> dict:
+def build_foundry_model(model_info, tags: dict, *, registry_name: str = "") -> dict:
     """Transform Azure ML model info into Foundry Local catalog format.
 
     Tag fields follow the public catalog schema:
     https://learn.microsoft.com/en-us/azure/ai-foundry/foundry-local/reference/reference-catalog-api
-    Reference model: qwen2.5-7b-instruct-vitis-npu in azureml registry.
+    Reference model: qwen3-0.6b-generic-cpu in azureml registry.
+
+    Args:
+        registry_name: Azure ML registry name, used to build the azureml:// Uri
+                       that FL needs for POST /openai/download.
     """
-    # Core annotation tags (always present)
+    # Core annotation tags (always present, matching FL reference exactly)
     annotation_tags: dict = {
-        "author": tags.get("uploaded_by", "unknown"),
         "alias": tags.get("alias", model_info.name),
+        "author": tags.get("author", tags.get("uploaded_by", "unknown")),
         "directoryPath": tags.get("directoryPath", model_info.name),
+        "disable-maap": tags.get("disable-maap", "True"),
+        "foundryLocal": tags.get("foundryLocal", "true"),
+        "inputModalities": tags.get("inputModalities", "text"),
         "license": tags.get("license", ""),
         "licenseDescription": tags.get("licenseDescription", ""),
-        "promptTemplate": tags.get("promptTemplate", ""),
-        "task": tags.get("task", "custom"),
-        "inputModalities": tags.get("inputModalities", ""),
-        "outputModalities": tags.get("outputModalities", ""),
+        "outputModalities": tags.get("outputModalities", "text"),
+        "task": tags.get("task", "chat-completion"),
     }
 
     # Optional tags - only include when set (mirrors public catalog behaviour)
     _optional = [
-        "foundryLocal",
         "maxOutputTokens",
+        "promptTemplate",
         "supportsToolCalling",
         "toolCallStart",
         "toolCallEnd",
@@ -79,7 +93,11 @@ def build_foundry_model(model_info, tags: dict) -> dict:
         if tags.get(key):
             annotation_tags[key] = tags[key]
 
-    return {
+    # Build azureml:// Uri for FL download (POST /openai/download)
+    reg = registry_name or "azureml"
+    model_uri = f"azureml://registries/{reg}/models/{model_info.name}/versions/{model_info.version}"
+
+    entry = {
         "assetId": f"{model_info.name}-v{model_info.version}",
         "version": str(model_info.version),
         "annotations": {
@@ -94,6 +112,7 @@ def build_foundry_model(model_info, tags: dict) -> dict:
             "name": model_info.name,
             "version": int(model_info.version) if model_info.version.isdigit() else 1,
             "alphanumericVersion": str(model_info.version),
+            "uri": model_uri,
             "variantInfo": {
                 "parents": [],
                 "variantMetadata": {
@@ -105,3 +124,4 @@ def build_foundry_model(model_info, tags: dict) -> dict:
             },
         },
     }
+    return entry

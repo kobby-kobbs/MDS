@@ -50,6 +50,8 @@ CUSTOMERS = {
         # Per-customer registry & storage (created by onboard.ps1)
         "registry_name": os.getenv("CUSTOMER_PHONEPE_REGISTRY", ""),
         "storage_account": os.getenv("CUSTOMER_PHONEPE_STORAGE", ""),
+        # API key for Foundry Local catalog access (no JWT required)
+        "api_key": os.getenv("CUSTOMER_PHONEPE_API_KEY", ""),
     },
     # Add more customers below
     # "acme": {
@@ -76,6 +78,22 @@ def get_customer_by_issuer(issuer: str) -> str | None:
         return None
     for customer_id, config in CUSTOMERS.items():
         if config.get("issuer") == issuer:
+            return customer_id
+    return None
+
+
+def get_customer_by_api_key(api_key: str) -> str | None:
+    """Look up customer ID by FL catalog API key.
+
+    Each customer can have a CUSTOMER_<ID>_API_KEY env var set.
+    FL sends this key via X-API-Key header when querying the catalog.
+    Returns the internal customer ID or None if no match.
+    """
+    if not api_key:
+        return None
+    for customer_id, config in CUSTOMERS.items():
+        key = config.get("api_key", "")
+        if key and key == api_key:
             return customer_id
     return None
 

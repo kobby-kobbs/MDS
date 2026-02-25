@@ -77,10 +77,14 @@ class TestBuildFoundryModel:
         assert variant["fileSizeBytes"] == 12345
 
     def test_optional_tags_omitted_when_empty(self):
-        """Optional tags (tool calling, maxOutputTokens) should NOT appear when not set."""
+        """Optional tags (tool calling, maxOutputTokens) should NOT appear when not set.
+        Core FL tags (foundryLocal, disable-maap) are always present."""
         result = build_foundry_model(_FakeModelInfo(), {})
         ann_tags = result["annotations"]["tags"]
-        assert "foundryLocal" not in ann_tags
+        # Core FL tags are always present
+        assert ann_tags["foundryLocal"] == "true"
+        assert ann_tags["disable-maap"] == "True"
+        # Optional tags should NOT appear
         assert "maxOutputTokens" not in ann_tags
         assert "supportsToolCalling" not in ann_tags
         assert "toolCallStart" not in ann_tags
@@ -90,8 +94,10 @@ class TestBuildFoundryModel:
         ann_tags = result["annotations"]["tags"]
 
         assert ann_tags["alias"] == "m"
-        assert ann_tags["task"] == "custom"
+        assert ann_tags["task"] == "chat-completion"
         assert ann_tags["author"] == "unknown"
+        assert ann_tags["disable-maap"] == "True"
+        assert ann_tags["foundryLocal"] == "true"
 
         variant = result["properties"]["variantInfo"]["variantMetadata"]
         assert variant["device"] == "cpu"
@@ -103,3 +109,15 @@ class TestBuildFoundryModel:
         result = build_foundry_model(info, {})
         assert result["properties"]["version"] == 1
         assert result["properties"]["alphanumericVersion"] == "beta"
+
+    def test_uri_default_registry(self):
+        """Without registry_name, Uri uses 'azureml' as default."""
+        info = _FakeModelInfo(name="mnist", version="3")
+        result = build_foundry_model(info, {})
+        assert result["properties"]["uri"] == "azureml://registries/azureml/models/mnist/versions/3"
+
+    def test_uri_custom_registry(self):
+        """With registry_name, Uri uses the customer's registry."""
+        info = _FakeModelInfo(name="qwen", version="2")
+        result = build_foundry_model(info, {}, registry_name="customer-phone")
+        assert result["properties"]["uri"] == "azureml://registries/customer-phone/models/qwen/versions/2"

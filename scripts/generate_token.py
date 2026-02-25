@@ -68,14 +68,6 @@ def ensure_keypair(customer_id: str = "phonepe"):
     priv_file = cust_dir / "private.pem"
     pub_file = cust_dir / "public.pem"
 
-    if customer_id == "phonepe" and not priv_file.exists():
-        old_priv = KEYS_DIR / "demo_private.pem"
-        old_pub = KEYS_DIR / "demo_public.pem"
-        if old_priv.exists() and old_pub.exists():
-            priv_file.write_text(old_priv.read_text())
-            pub_file.write_text(old_pub.read_text())
-            print(f"[OK] Migrated existing keypair to {cust_dir}")
-
     if priv_file.exists() and pub_file.exists():
         print(f"[OK] Loaded existing keypair from {cust_dir}")
         private_pem = priv_file.read_text()

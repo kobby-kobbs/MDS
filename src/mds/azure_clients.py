@@ -76,7 +76,11 @@ def upload_to_blob(
         container.create_container()
     except Exception:
         pass  # Already exists
-    container.get_blob_client(blob_name).upload_blob(content, overwrite=True)
+    container.get_blob_client(blob_name).upload_blob(
+        content, overwrite=True, max_concurrency=4,
+        max_single_put_size=8 * 1024 * 1024,    # use block upload above 8 MB
+        chunk_size=4 * 1024 * 1024,              # 4 MB blocks for parallel upload
+    )
     return f"https://{acct}.blob.core.windows.net/{STORAGE_CONTAINER}/{blob_name}"
 
 

@@ -102,45 +102,58 @@ def _download_file(url, target, file_num=0, file_total=0):
     print(f"\r  {label}{target.name:<40} {_human(downloaded):>10}  {elapsed:.1f}s{' '*20}")
 
 def _download_via_sdk(model, version, out_dir):
-    """Download using azure-storage-blob SDK (no SAS URLs, uses DefaultAzureCredential)."""
+    """Download using azure-storage-blob SDK with SAS URLs for parallel/fast downloads."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
     try:
-        from azure.storage.blob import ContainerClient
-        from azure.identity import DefaultAzureCredential
+        from azure.storage.blob import BlobClient
     except ImportError:
-        print("  [ERROR] Install azure-storage-blob and azure-identity:"); print("    pip install azure-storage-blob azure-identity"); return
-    # Get blob list from MDS API
-    print("  Fetching file list from MDS...")
+        print("  [ERROR] Install azure-storage-blob:"); print("    pip install azure-storage-blob"); return
+    # Get SAS URLs from MDS API (no local Azure credentials needed)
+    print("  Fetching download URLs from MDS...")
     r = requests.post(f"{BASE_URL}/download", params={"model": model, "version": version}, headers=_headers(), timeout=60)
     r.raise_for_status(); data = r.json()
     if "download_url" in data and "files" not in data:
-        # Single file - fall back to URL download
         print("  Single file model, using URL download..."); out_dir.mkdir(parents=True, exist_ok=True)
         _download_file(data["download_url"], out_dir / (PurePosixPath(data["download_url"].split("?")[0]).name or model), 1, 1)
         return
     files = data.get("files", [])
     if not files: print("  [WARN] No files returned."); return
-    # Extract storage account and container from a SAS URL
-    sample_url = files[0]["download_url"]
-    from urllib.parse import urlparse
-    parsed = urlparse(sample_url)
-    account_url = f"{parsed.scheme}://{parsed.hostname}"
-    container_name = parsed.path.split("/")[1]
-    print(f"  Storage: {parsed.hostname}  Container: {container_name}")
-    print(f"  {len(files)} file(s) to download via Azure SDK")
-    cred = DefaultAzureCredential()
-    container = ContainerClient(account_url, container_name, credential=cred)
     out_dir.mkdir(parents=True, exist_ok=True)
-    for idx, entry in enumerate(files, 1):
+    total_files = len(files)
+    total_bytes, downloaded_bytes = 0, 0
+    lock = threading.Lock()
+    t0 = time.time()
+    WORKERS = min(6, total_files)  # parallel file downloads
+
+    def _dl_one(idx, entry):
+        nonlocal downloaded_bytes
         blob_name = entry["file"]
+        sas_url = entry["download_url"]
         parts = PurePosixPath(blob_name).parts
         rel = str(PurePosixPath(*parts[2:])) if len(parts) > 2 and parts[1][:1] == "v" and parts[1][1:].isdigit() else PurePosixPath(blob_name).name
         target = out_dir / rel; target.parent.mkdir(parents=True, exist_ok=True)
-        print(f"  [{idx}/{len(files)}] {rel}...", end="", flush=True)
-        t0 = time.time()
-        blob_data = container.get_blob_client(blob_name).download_blob().readall()
-        target.write_bytes(blob_data)
-        elapsed = time.time() - t0
-        print(f" {_human(len(blob_data))} ({elapsed:.1f}s)")
+        # Use Azure SDK for parallel chunk download (max_concurrency)
+        blob_client = BlobClient.from_blob_url(sas_url)
+        stream = blob_client.download_blob(max_concurrency=4)
+        data = stream.readall()
+        target.write_bytes(data)
+        fsize = len(data)
+        with lock:
+            downloaded_bytes += fsize
+            elapsed = time.time() - t0
+            speed = _human(downloaded_bytes / elapsed) + "/s" if elapsed > 0.1 else "---"
+            print(f"  [{idx}/{total_files}] {rel:<40} {_human(fsize):>10}  ({speed} overall)")
+        return fsize
+
+    print(f"  {total_files} file(s) to download (parallel={WORKERS})")
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        futures = {pool.submit(_dl_one, i, entry): i for i, entry in enumerate(files, 1)}
+        for future in as_completed(futures):
+            total_bytes += future.result()
+    elapsed = time.time() - t0
+    speed = _human(total_bytes / elapsed) + "/s" if elapsed > 0 else "?"
+    print(f"  Download complete: {_human(total_bytes)} in {elapsed:.1f}s ({speed})")
 
 # -- Shared upload helpers --------------------------------------------------------
 
@@ -397,6 +410,69 @@ def cmd_catalog(args):
         name = m.get("annotations", {}).get("displayName", m.get("properties", {}).get("name", "?"))
         print(f"  {name:<40} task={m.get('properties',{}).get('task','?')}")
 
+def cmd_catalog_fl(args):
+    """List private MDS models via the Foundry Local catalog API (API-key auth)."""
+    api_key = getattr(args, "api_key", None) or os.getenv("MDS_API_KEY", "")
+    if not api_key:
+        print("[ERROR] API key required.  Use --api-key KEY  or  set MDS_API_KEY env var."); sys.exit(1)
+    device = getattr(args, "device", None)
+    ep = getattr(args, "execution_provider", None)
+    body = {"indexEntitiesRequest": {"pageSize": 100, "filters": []}}
+    if device:
+        body["indexEntitiesRequest"]["filters"].append(
+            {"field": "properties/variantInfo/variantMetadata/device", "operator": "eq", "values": [device]})
+    if ep:
+        body["indexEntitiesRequest"]["filters"].append(
+            {"field": "properties/variantInfo/variantMetadata/executionProvider", "operator": "eq", "values": [ep]})
+    r = requests.post(f"{BASE_URL}/catalog/foundrylocal/{api_key}", json=body, timeout=60)
+    r.raise_for_status()
+    resp = r.json().get("indexEntitiesResponse", {})
+    models = resp.get("value", [])
+    print(f"\nMDS Private Models  ({len(models)} found)")
+    print(f"  {'NAME':<40} {'VER':>4}  {'DEVICE':<5}  {'EP':<28}  {'SIZE':>8}  URI")
+    print(f"  {'-'*40} {'-'*4}  {'-'*5}  {'-'*28}  {'-'*8}  {'-'*50}")
+    for m in models:
+        props = m.get("properties", {})
+        ann = m.get("annotations", {})
+        vm = props.get("variantInfo", {}).get("variantMetadata", {})
+        name = ann.get("name", props.get("name", "?"))
+        ver = m.get("version", props.get("version", "?"))
+        device_type = vm.get("device", "?")
+        exec_prov = vm.get("executionProvider", "?")
+        size_bytes = vm.get("fileSizeBytes", 0)
+        size_str = _human(size_bytes) if size_bytes else "?"
+        uri = m.get("uri", "")
+        print(f"  {name:<40} {str(ver):>4}  {device_type:<5}  {exec_prov:<28}  {size_str:>8}  {uri}")
+
+def cmd_download_fl(args):
+    """Download a model from the Foundry Local public catalog via `foundry model download`."""
+    import shutil, subprocess
+    foundry = shutil.which("foundry") or shutil.which("foundry.exe")
+    if not foundry:
+        print("[ERROR] `foundry` CLI not found in PATH. Install from: https://learn.microsoft.com/azure/ai-foundry/foundry-local/get-started")
+        sys.exit(1)
+    model_name = args.model_name
+    print(f"\n  Downloading '{model_name}' via Foundry Local CLI...")
+    print(f"  (This downloads from the public Azure Foundry catalog)\n")
+    cmd = [foundry, "model", "download", model_name]
+    try:
+        proc = subprocess.run(cmd, check=False)
+        if proc.returncode != 0:
+            print(f"\n  [ERROR] foundry model download exited with code {proc.returncode}")
+            sys.exit(proc.returncode)
+        print(f"\n  Done. Model '{model_name}' is now cached locally.")
+        print(f"  Run: foundry model run {model_name}")
+    except FileNotFoundError:
+        print("[ERROR] Failed to run foundry CLI."); sys.exit(1)
+
+def cmd_list_fl(_):
+    """List models from the Foundry Local public catalog via `foundry model list`."""
+    import shutil, subprocess
+    foundry = shutil.which("foundry") or shutil.which("foundry.exe")
+    if not foundry:
+        print("[ERROR] `foundry` CLI not found in PATH."); sys.exit(1)
+    subprocess.run([foundry, "model", "list"], check=False)
+
 def cmd_download(args):
     model, version, out_dir = args.model_name, args.version, Path(args.output or f"./{args.model_name}")
     method = getattr(args, 'method', None) or args.format or "urls"
@@ -503,22 +579,63 @@ def _interactive():
     # Step 3: Action loop
     while True:
         print(f"\n{'- '*30}\n  Step 3: Choose action\n{'- '*30}")
-        idx, _ = _pick("Action", ["Download a model", "Upload a model", "View model details",
-                                   "Foundry Local catalog", "Sync report", "Refresh", "Exit"])
+        idx, _ = _pick("Action", [
+            "List models       (choose source: MDS or Foundry Local)",
+            "Download a model  (choose source: MDS or Foundry Local)",
+            "Upload a model    (MDS blob storage)",
+            "View model details (MDS)",
+            "Sync report       (MDS registry vs blob)",
+            "Exit",
+        ])
         try:
-            if idx == 7: print("\n  Goodbye!"); break
-            elif idx == 6: models, reg = _fetch_models(); _show_models(models, reg)
+            if idx == 6: print("\n  Goodbye!"); break
             elif idx == 5: cmd_sync(None)
-            elif idx == 4: cmd_catalog(argparse.Namespace(page_size=50))
-            elif idx == 3:
+            elif idx == 4:
                 _, name = _pick("Model", [m["name"] for m in models]) if models else (0, input("  Model name: ").strip())
                 cmd_info(argparse.Namespace(model_name=name, version=None))
-            elif idx == 1: _interactive_download(models)
-            elif idx == 2: _interactive_upload()
+            elif idx == 3: _interactive_upload()
+            elif idx == 1:  # List
+                src, _ = _pick("List from which source?", [
+                    "MDS Private Models  (your blob storage, requires JWT)",
+                    "Foundry Local       (public Microsoft catalog, 107+ models)",
+                ])
+                if src == 1:
+                    models, reg = _fetch_models(); _show_models(models, reg)
+                else:
+                    cmd_list_fl(None)
+            elif idx == 2:  # Download
+                src, _ = _pick("Download from which source?", [
+                    "MDS Private Models  (your blob storage, requires JWT)",
+                    "Foundry Local       (public Microsoft catalog, uses foundry CLI)",
+                ])
+                if src == 1:
+                    if not models: models, reg = _fetch_models(); _show_models(models, reg)
+                    _interactive_download(models)
+                else:
+                    _interactive_download_fl()
         except requests.HTTPError as e:
             print(f"  [ERROR] HTTP {e.response.status_code}: {e.response.text[:300]}")
         except Exception as e:
             print(f"  [ERROR] {e}")
+
+def _interactive_download_fl():
+    """Interactive flow for downloading a model from the Foundry Local public catalog."""
+    import shutil, subprocess
+    foundry = shutil.which("foundry") or shutil.which("foundry.exe")
+    if not foundry:
+        print("  [ERROR] `foundry` CLI not found. Install from: https://learn.microsoft.com/azure/ai-foundry/foundry-local/get-started")
+        return
+    # Show FL catalog first
+    print("\n  Fetching Foundry Local catalog...")
+    subprocess.run([foundry, "model", "list"], check=False)
+    name = input("\n  Enter model name or alias to download: ").strip()
+    if not name: print("  Cancelled."); return
+    print(f"\n  Downloading '{name}' via Foundry Local CLI...")
+    proc = subprocess.run([foundry, "model", "download", name], check=False)
+    if proc.returncode == 0:
+        print(f"\n  Done! Run:  foundry model run {name}")
+    else:
+        print(f"\n  [ERROR] Download failed (exit code {proc.returncode})")
 
 def _interactive_download(models):
     _, name = _pick("Download which model?", [m["name"] for m in models]) if models else (0, input("  Model name: ").strip())
@@ -534,7 +651,7 @@ def _interactive_download(models):
     _, method = _pick("Download method", [
         "SAS URL (direct from Azure Storage -- fast)",
         "ZIP archive (server packages all files)",
-        "Azure SDK (BlobServiceClient -- requires azure-storage-blob)",
+        "Parallel download (Azure SDK -- fastest for large models)",
     ])
     default = f"./{name}"
     raw = input(f"  Output dir [{default}]: ").strip().strip('"')
@@ -543,7 +660,7 @@ def _interactive_download(models):
     t0 = time.time()
     if "ZIP" in method:
         _download_zip(name, ver, out)
-    elif "SDK" in method:
+    elif "Parallel" in method:
         _download_via_sdk(name, ver, out)
     else:
         _download_urls(name, ver, out)
@@ -604,6 +721,13 @@ def main():
     sub.add_parser("sync", help="Sync report: registry vs blob")
     ip = sub.add_parser("info", help="Model detail"); ip.add_argument("model_name"); ip.add_argument("--version", "-v", default=None)
     cp = sub.add_parser("catalog", help="Foundry Local catalog"); cp.add_argument("--page-size", type=int, default=50)
+    fp = sub.add_parser("catalog-fl", help="List private MDS models (API-key auth)")
+    fp.add_argument("--api-key", default=None, help="MDS API key (or set MDS_API_KEY env)")
+    fp.add_argument("--device", choices=["cpu", "gpu"], default=None, help="Filter by device type")
+    fp.add_argument("--execution-provider", default=None, help="Filter by execution provider")
+    sub.add_parser("list-fl", help="List Foundry Local public catalog models")
+    fl_dl = sub.add_parser("download-fl", help="Download from Foundry Local public catalog")
+    fl_dl.add_argument("model_name", help="Model name or alias (e.g. phi-4-mini)")
     dp = sub.add_parser("download", help="Download model"); dp.add_argument("model_name")
     dp.add_argument("--version", "-v", default=None); dp.add_argument("--output", "-o", default=None)
     dp.add_argument("--format", "-f", choices=["urls", "zip"], default="urls")
@@ -618,6 +742,7 @@ def main():
     if args.base_url != BASE_URL: _set_base_url(args.base_url)
     if not args.command: _interactive(); return
     cmds = {"list": cmd_list, "sync": cmd_sync, "info": cmd_info, "catalog": cmd_catalog,
+            "catalog-fl": cmd_catalog_fl, "list-fl": cmd_list_fl, "download-fl": cmd_download_fl,
             "download": cmd_download, "upload": cmd_upload, "upload-staged": cmd_upload_staged}
     try: cmds[args.command](args)
     except requests.HTTPError as e: print(f"\n[ERROR] HTTP {e.response.status_code}: {e.response.text[:300]}"); sys.exit(1)

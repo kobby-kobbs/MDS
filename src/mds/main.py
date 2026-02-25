@@ -12,8 +12,8 @@ from pydantic import BaseModel
 from .auth import check_entitlement, require_auth
 from .azure_clients import (REGISTRY_NAME, STORAGE_ACCOUNT, download_blob, generate_sas_url,
                              generate_upload_sas_url, get_ml_client, list_blob_prefixes, list_blobs, upload_to_blob)
-from .catalog import CatalogRequest, build_foundry_model, decode_continuation_token, encode_continuation_token
-from .customers import get_customer_registry, get_customer_storage
+from .catalog import CatalogRequest, FLCatalogQuery, build_foundry_model, decode_continuation_token, encode_continuation_token
+from .customers import get_customer_by_api_key, get_customer_registry, get_customer_storage
 from .metadata import extract_onnx_metadata
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
@@ -59,14 +59,37 @@ def _build_upload_tags(claims: dict, auto_tags: dict, **ov) -> dict:
     total_bytes, model_name = ov.pop("total_bytes", 0), ov.pop("model_name", "")
     tags = {**auto_tags, "uploaded_by": claims["customer_id"],
             "file_size_bytes": str(total_bytes), "upload_time": datetime.now(timezone.utc).isoformat(),
+            # Core FL tags (always set)
             "alias": ov.pop("alias", "") or model_name,
+            "author": ov.pop("author", "") or "Microsoft",
+            "directoryPath": ov.pop("directory_path", "") or model_name,
             "task": ov.pop("task", "") or auto_tags.get("task", "custom"),
             "inputModalities": ov.pop("input_modalities", "text") or auto_tags.get("inputModalities", "text"),
             "outputModalities": ov.pop("output_modalities", "text") or auto_tags.get("outputModalities", "text"),
             "device": ov.pop("device", "cpu"),
             "executionProvider": ov.pop("execution_provider", "cpuexecutionprovider"),
             "modelType": ov.pop("model_type", "onnx") or auto_tags.get("modelType", "onnx"),
-            "foundryLocal": "true"}
+            "foundryLocal": "true",
+            "disable-maap": ov.pop("disable_maap", "True")}
+    # License tags
+    for lk in ("license", "licenseDescription"):
+        field = {"license": "license_id", "licenseDescription": "license_description"}.get(lk, lk)
+        val = ov.pop(field, "") or auto_tags.get(lk, "")
+        if val:
+            tags[lk] = val
+    # Optional FL tags (maxOutputTokens, promptTemplate, supportsToolCalling, tool* tags)
+    _optional_fl = [
+        ("max_output_tokens", "maxOutputTokens"), ("prompt_template", "promptTemplate"),
+        ("supports_tool_calling", "supportsToolCalling"),
+        ("tool_call_start", "toolCallStart"), ("tool_call_end", "toolCallEnd"),
+        ("tool_register_start", "toolRegisterStart"), ("tool_register_end", "toolRegisterEnd"),
+        ("tool_response_start", "toolResponseStart"), ("tool_response_end", "toolResponseEnd"),
+    ]
+    for field, tag in _optional_fl:
+        val = ov.pop(field, "") or auto_tags.get(tag, "")
+        if val:
+            tags[tag] = val
+    # Blob tracking tags
     for key in ("blob_name", "blob_prefix", "blob_files"):
         val = ov.pop(key, "")
         if val:
@@ -74,6 +97,7 @@ def _build_upload_tags(claims: dict, auto_tags: dict, **ov) -> dict:
     bc = ov.pop("blob_count", 0)
     if bc > 0:
         tags["blob_count"] = str(bc)
+    # Pass-through any remaining overrides
     for k, v in ov.items():
         if v:
             tags[k] = str(v)
@@ -249,6 +273,7 @@ def catalog(request: CatalogRequest, authorization: str = Header(...)):
     else:
         skip = req.skip if req and req.skip else 0
     cid = claims["customer_id"]
+    reg = get_customer_registry(cid)
     def _fetch():
         ml, _ = _client_for(cid)
         out = []
@@ -257,7 +282,7 @@ def catalog(request: CatalogRequest, authorization: str = Header(...)):
                 continue
             try:
                 info = ml.models.get(name=m.name, version=m.latest_version)
-                out.append(build_foundry_model(info, info.tags or {}))
+                out.append(build_foundry_model(info, info.tags or {}, registry_name=reg or REGISTRY_NAME))
             except Exception:
                 pass
         return out
@@ -267,6 +292,161 @@ def catalog(request: CatalogRequest, authorization: str = Header(...)):
     if ns < total:
         resp["indexEntitiesResponse"]["continuationToken"] = encode_continuation_token(ns, page_size)
     return resp
+
+
+@app.post("/catalog/fl")
+def catalog_fl(request: FLCatalogQuery = None, authorization: str = Header(...)):
+    """Foundry Local native catalog endpoint.
+
+    Returns models in the exact format FL expects, with optional filtering
+    by task, device, or modality. Only models tagged foundryLocal=true are included.
+    """
+    claims = require_auth(authorization)
+    cid = claims["customer_id"]
+    req = request or FLCatalogQuery()
+    page_size = req.pageSize or 50
+    if req.continuationToken:
+        skip, page_size = decode_continuation_token(req.continuationToken)
+    else:
+        skip = 0
+
+    def _fetch_fl():
+        ml, _ = _client_for(cid)
+        reg = get_customer_registry(cid)
+        out = []
+        for m in ml.models.list():
+            if not check_entitlement(claims, m.name):
+                continue
+            try:
+                info = ml.models.get(name=m.name, version=m.latest_version)
+                tags = info.tags or {}
+                # Only include FL-tagged models
+                if tags.get("foundryLocal", "").lower() not in ("true", "test"):
+                    continue
+                out.append(build_foundry_model(info, tags, registry_name=reg or REGISTRY_NAME))
+            except Exception:
+                pass
+        return out
+
+    models = _cached(_catalog_cache, f"fl_{cid}", _fetch_fl)
+
+    # Apply filters
+    filtered = models
+    if req.task:
+        filtered = [m for m in filtered if m["annotations"]["tags"].get("task", "").lower() == req.task.lower()]
+    if req.device:
+        filtered = [m for m in filtered if m["properties"]["variantInfo"]["variantMetadata"].get("device", "").lower() == req.device.lower()]
+    if req.modality:
+        filtered = [m for m in filtered if req.modality.lower() in m["annotations"]["tags"].get("inputModalities", "").lower()]
+
+    total = len(filtered)
+    page = filtered[skip:skip + page_size]
+    ns = skip + page_size
+    resp = {
+        "totalCount": total,
+        "models": page,
+        "nextSkip": ns if ns < total else None,
+    }
+    if ns < total:
+        resp["continuationToken"] = encode_continuation_token(ns, page_size)
+    return resp
+
+
+# ─── FL-native catalog (AzureCatalogUri target) ─────────────────────────
+# This is the endpoint FL calls when configured with:
+#   additionalSettings: { "AzureCatalogUri": "https://mds.../catalog/foundrylocal/<api-key>" }
+#
+# Auth: API key in URL path (preferred -- works with all FL versions),
+#        or X-API-Key header, or JWT Bearer fallback.
+# Request/Response: standard FL indexEntitiesRequest/Response format.
+# Ref: https://learn.microsoft.com/azure/ai-foundry/foundry-local/reference/reference-catalog-api
+
+
+def _fl_catalog_handler(cid: str, request: CatalogRequest = None):
+    """Shared FL catalog logic -- returns indexEntitiesResponse for a customer."""
+    from .customers import CUSTOMERS
+    customer = CUSTOMERS.get(cid, {})
+    claims = {"customer_id": cid, "sub": customer.get("sub", cid)}
+
+    req = request.indexEntitiesRequest if request else None
+    page_size = req.pageSize if req and req.pageSize else 100
+    if req and req.continuationToken:
+        skip, page_size = decode_continuation_token(req.continuationToken)
+    else:
+        skip = req.skip if req and req.skip else 0
+
+    def _fetch_fl_native():
+        ml, _ = _client_for(cid)
+        reg = get_customer_registry(cid)
+        out = []
+        for m in ml.models.list():
+            if not check_entitlement(claims, m.name):
+                continue
+            try:
+                info = ml.models.get(name=m.name, version=m.latest_version)
+                tags = info.tags or {}
+                if tags.get("foundryLocal", "").lower() not in ("true", "test"):
+                    continue
+                out.append(build_foundry_model(info, tags, registry_name=reg or REGISTRY_NAME))
+            except Exception:
+                pass
+        return out
+
+    models = _cached(_catalog_cache, f"flnat_{cid}", _fetch_fl_native)
+
+    total = len(models)
+    page = models[skip:skip + page_size]
+    ns = skip + page_size
+    resp = {
+        "indexEntitiesResponse": {
+            "totalCount": total,
+            "value": page,
+            "nextSkip": ns if ns < total else None,
+            "continuationToken": encode_continuation_token(ns, page_size) if ns < total else None,
+        }
+    }
+    log.info(f"FL catalog | customer={cid} | {total} models | page {skip}-{skip+len(page)}")
+    return resp
+
+
+@app.post("/catalog/foundrylocal/{api_key}")
+def catalog_foundrylocal_keyed(
+    api_key: str,
+    request: CatalogRequest = None,
+):
+    """FL catalog endpoint with API key in URL path.
+
+    Use this as the AzureCatalogUri -- guaranteed to work since FL
+    just POSTs to the URL without adding custom headers:
+        AzureCatalogUri: https://mds.../catalog/foundrylocal/<api-key>
+    """
+    cid = get_customer_by_api_key(api_key)
+    if not cid:
+        raise HTTPException(401, "Invalid API key")
+    return _fl_catalog_handler(cid, request)
+
+
+@app.post("/catalog/foundrylocal")
+def catalog_foundrylocal(
+    request: CatalogRequest = None,
+    x_api_key: str = Header(None, alias="X-API-Key"),
+    authorization: str = Header(None),
+):
+    """FL catalog endpoint with header-based auth.
+
+    Supports X-API-Key header or JWT Bearer token.
+    """
+    cid = None
+    if x_api_key:
+        cid = get_customer_by_api_key(x_api_key)
+        if not cid:
+            raise HTTPException(401, "Invalid API key")
+    elif authorization:
+        claims = require_auth(authorization)
+        cid = claims["customer_id"]
+    else:
+        raise HTTPException(401, "X-API-Key or Authorization header required")
+    return _fl_catalog_handler(cid, request)
 
 
 @app.get("/models/{name}/versions")
@@ -293,6 +473,7 @@ def get_model(name: str, version: str = Query(None), authorization: str = Header
     if not check_entitlement(claims, name):
         raise HTTPException(403, f"Not entitled to: {name}")
     cid = claims["customer_id"]
+    reg = get_customer_registry(cid)
     def _fetch():
         ml, _ = _client_for(cid)
         try:
@@ -307,7 +488,7 @@ def get_model(name: str, version: str = Query(None), authorization: str = Header
             raise
         except Exception:
             raise HTTPException(404, f"Not found: {name}")
-        return build_foundry_model(info, info.tags or {})
+        return build_foundry_model(info, info.tags or {}, registry_name=reg or REGISTRY_NAME)
     return _cached(_model_info_cache, (name, version or "latest", cid), _fetch)
 
 
@@ -319,12 +500,8 @@ _FIELD_TO_TAG = {
     "supports_tool_calling": "supportsToolCalling", "tool_call_start": "toolCallStart",
     "tool_call_end": "toolCallEnd", "tool_register_start": "toolRegisterStart",
     "tool_register_end": "toolRegisterEnd", "tool_response_start": "toolResponseStart",
-    "tool_response_end": "toolResponseEnd", "framework": "framework",
-    "framework_version": "frameworkVersion", "model_hash": "modelHash",
-    "training_data_version": "trainingDataVersion", "expiration_date": "expirationDate",
-    "dependencies": "dependencies", "parent_model": "parentModel",
-    "usage_guidelines": "usageGuidelines", "metrics": "metrics",
-    "author": "author", "directory_path": "directoryPath",
+    "tool_response_end": "toolResponseEnd", "author": "author",
+    "directory_path": "directoryPath", "disable_maap": "disable-maap",
 }
 
 
@@ -340,11 +517,8 @@ async def upload(
     tool_call_start: str = Form(""), tool_call_end: str = Form(""),
     tool_register_start: str = Form(""), tool_register_end: str = Form(""),
     tool_response_start: str = Form(""), tool_response_end: str = Form(""),
-    framework: str = Form(""), framework_version: str = Form(""),
-    model_hash: str = Form(""), training_data_version: str = Form(""),
-    expiration_date: str = Form(""), dependencies: str = Form(""),
-    parent_model: str = Form(""), usage_guidelines: str = Form(""),
-    metrics: str = Form(""), files: List[UploadFile] = File(...),
+    disable_maap: str = Form("True"),
+    files: List[UploadFile] = File(...),
     authorization: str = Header(...),
 ):
     claims = require_auth(authorization)
@@ -422,6 +596,7 @@ class UploadBeginRequest(BaseModel):
     supports_tool_calling: str = ""; tool_call_start: str = ""; tool_call_end: str = ""
     tool_register_start: str = ""; tool_register_end: str = ""
     tool_response_start: str = ""; tool_response_end: str = ""
+    disable_maap: str = "True"
 
 class UploadCompleteRequest(BaseModel):
     session_id: str; description: str | None = None; task: str | None = None; model_type: str | None = None
@@ -442,6 +617,8 @@ def upload_begin(req: UploadBeginRequest, authorization: str = Header(...)):
     meta = {tag: rd.get(field, "") for field, tag in _FIELD_TO_TAG.items() if field in rd}
     meta["alias"] = meta.get("alias", "") or req.model_name
     meta["directoryPath"] = meta.get("directoryPath", "") or req.model_name
+    meta["author"] = meta.get("author", "") or "Microsoft"
+    meta["disable-maap"] = meta.pop("disable-maap", "") or rd.get("disable_maap", "True")
     _save_session(sid, {"customer_id": cid, "storage_account": sa, "model_name": req.model_name,
                         "description": req.description, "next_version": nv, "blob_prefix": bp,
                         "metadata": meta, "created": datetime.now(timezone.utc).isoformat()})
@@ -469,10 +646,13 @@ def upload_complete(req: UploadCompleteRequest, authorization: str = Header(...)
     meta = session["metadata"]
     tags = {"uploaded_by": cid, "blob_prefix": session["blob_prefix"], "blob_files": ",".join(blobs),
             "blob_count": str(len(blobs)), "upload_time": datetime.now(timezone.utc).isoformat(),
-            "alias": meta.get("alias", mn), "task": req.task or meta.get("task", "custom"),
+            "alias": meta.get("alias", mn), "author": meta.get("author", "Microsoft"),
+            "directoryPath": meta.get("directoryPath", mn),
+            "task": req.task or meta.get("task", "custom"),
             "inputModalities": meta.get("inputModalities", "text"), "outputModalities": meta.get("outputModalities", "text"),
             "device": meta.get("device", "cpu"), "executionProvider": meta.get("executionProvider", "cpuexecutionprovider"),
-            "modelType": req.model_type or meta.get("modelType", "onnx"), "foundryLocal": "true", "staged_upload": "true"}
+            "modelType": req.model_type or meta.get("modelType", "onnx"),
+            "foundryLocal": "true", "disable-maap": meta.get("disable-maap", "True"), "staged_upload": "true"}
     for k, v in meta.items():
         if v and k not in tags:
             tags[k] = v

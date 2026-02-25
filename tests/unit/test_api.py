@@ -222,6 +222,75 @@ class TestCatalog:
             assert "value" in resp
 
 
+# -- FL Native Catalog (API key auth) ---------------------------------
+
+class TestFLNativeCatalog:
+    def test_rejects_no_auth(self, client):
+        r = client.post("/catalog/foundrylocal", json={})
+        assert r.status_code in (401, 422)
+
+    def test_rejects_bad_api_key(self, client):
+        r = client.post(
+            "/catalog/foundrylocal",
+            json={},
+            headers={"X-API-Key": "bad-key-12345"},
+        )
+        assert r.status_code == 401
+
+    def test_with_jwt_fallback(self, client, rsa_keypair, valid_token):
+        """Falls back to JWT auth when no API key is provided."""
+        _, pub = rsa_keypair
+        with patch("mds.auth.get_public_key", return_value=pub):
+            r = client.post(
+                "/catalog/foundrylocal",
+                json={},
+                headers={"Authorization": f"Bearer {valid_token}"},
+            )
+            assert r.status_code == 200
+            resp = r.json()["indexEntitiesResponse"]
+            assert "totalCount" in resp
+            assert "value" in resp
+
+    def test_with_api_key(self, client, rsa_keypair):
+        """API key auth returns indexEntitiesResponse format."""
+        with patch("mds.main.get_customer_by_api_key", return_value="phonepe"):
+            r = client.post(
+                "/catalog/foundrylocal",
+                json={},
+                headers={"X-API-Key": "test-api-key"},
+            )
+            assert r.status_code == 200
+            body = r.json()
+            assert "indexEntitiesResponse" in body
+            resp = body["indexEntitiesResponse"]
+            assert "totalCount" in resp
+            assert "value" in resp
+            # Models should have uri field for FL download
+            for model in resp["value"]:
+                assert "uri" in model["properties"]
+                assert model["properties"]["uri"].startswith("azureml://registries/")
+
+    # ── URL-path API key variant ───────────────────────────────────────
+
+    def test_keyed_rejects_bad_key(self, client):
+        r = client.post("/catalog/foundrylocal/bad-key-12345", json={})
+        assert r.status_code == 401
+
+    def test_keyed_returns_catalog(self, client):
+        """URL-path API key variant returns same indexEntitiesResponse."""
+        with patch("mds.main.get_customer_by_api_key", return_value="phonepe"):
+            r = client.post("/catalog/foundrylocal/test-api-key", json={})
+            assert r.status_code == 200
+            body = r.json()
+            assert "indexEntitiesResponse" in body
+            resp = body["indexEntitiesResponse"]
+            assert "totalCount" in resp
+            assert "value" in resp
+            for model in resp["value"]:
+                assert "uri" in model["properties"]
+                assert model["properties"]["uri"].startswith("azureml://registries/")
+
+
 # -- Model Detail -----------------------------------------------------
 
 class TestModelDetail:
