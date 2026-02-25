@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+gunicorn
+pyjwt
+cryptography
+python-multipart
+azure-storage-blob
+azure-ai-ml
+azure-identity
+requests
+cachetools
