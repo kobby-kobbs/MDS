@@ -117,7 +117,7 @@ class TestZipArchiveExtraction:
         assert tags["modelType"] == "qwen2"
         assert tags["architecture"] == "Qwen2ForCausalLM"
         assert tags["task"] == "text-generation"
-        assert tags["maxOutputTokens"] == "32768"
+        assert tags["contextLength"] == "32768"
 
     def test_zip_with_tokenizer_config(self):
         tok = json.dumps({
@@ -242,12 +242,12 @@ class TestMergeConfigJson:
     def test_max_position_embeddings(self):
         tags = {}
         _merge_config_json(tags, {"max_position_embeddings": 4096})
-        assert tags["maxOutputTokens"] == "4096"
+        assert tags["contextLength"] == "4096"
 
     def test_n_positions_fallback(self):
         tags = {}
         _merge_config_json(tags, {"n_positions": 2048})
-        assert tags["maxOutputTokens"] == "2048"
+        assert tags["contextLength"] == "2048"
 
     def test_no_architecture(self):
         tags = {}

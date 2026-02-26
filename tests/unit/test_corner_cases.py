@@ -335,7 +335,7 @@ class TestLargePayloads:
             zf.writestr("model/model.onnx", b"\x00" * (1024 * 1024))
         tags = extract_onnx_metadata(buf.getvalue(), "big-model.zip")
         assert tags.get("modelType") == "gpt2"
-        assert tags.get("maxOutputTokens") == "1024"
+        assert tags.get("contextLength") == "1024"
 
 
 # =======================================================================
@@ -539,7 +539,7 @@ class TestArchiveMetadataExtraction:
             "config.json": json.dumps({"model_type": "gpt2", "max_position_embeddings": 2048}),
         })
         tags = extract_onnx_metadata(data, "gpt2.zip")
-        assert tags.get("maxOutputTokens") == "2048"
+        assert tags.get("contextLength") == "2048"
 
     def test_tokenizer_config_extracts_chat_template(self):
         data = self._make_zip({
@@ -583,7 +583,7 @@ class TestArchiveMetadataExtraction:
         tags = extract_onnx_metadata(data, "phi-model.zip")
         assert tags["modelType"] == "phi"
         assert tags["architecture"] == "PhiForCausalLM"
-        assert tags["maxOutputTokens"] == "4096"
+        assert tags["contextLength"] == "4096"
         assert tags["tokenizerClass"] == "CodeGenTokenizer"
         assert tags["license"] == "mit"
 

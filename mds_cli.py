@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 import requests
 
 BASE_URL = os.getenv("MDS_BASE_URL", "https://mds-model-distribution.azurewebsites.net")
+FL_URL = os.getenv("FL_SERVICE_URL", "http://localhost:60076")
 _TOKEN = os.getenv("MDS_TOKEN", "")
 
 def _set_base_url(url: str):
@@ -460,10 +461,24 @@ def cmd_download_fl(args):
         if proc.returncode != 0:
             print(f"\n  [ERROR] foundry model download exited with code {proc.returncode}")
             sys.exit(proc.returncode)
-        print(f"\n  Done. Model '{model_name}' is now cached locally.")
-        print(f"  Run: foundry model run {model_name}")
+        print(f"\n  ✓ Model '{model_name}' is now cached locally.")
     except FileNotFoundError:
         print("[ERROR] Failed to run foundry CLI."); sys.exit(1)
+    # Offer to run the model immediately
+    run_now = getattr(args, '_run_after', None)
+    if run_now is None:
+        try:
+            run_now = input("\n  Run this model now? [Y/n]: ").strip().lower() != "n"
+        except (KeyboardInterrupt, EOFError):
+            run_now = False
+    if run_now:
+        if not _fl_ensure_service():
+            print("  Cannot start Foundry Local service. Run manually:")
+            print(f"    foundry service start && mds run {model_name}")
+            return
+        cmd_run(argparse.Namespace(
+            model_name=model_name, temperature=0.7, max_tokens=800,
+            system=None, no_stream=False))
 
 def cmd_list_fl(_):
     """List models from the Foundry Local public catalog via `foundry model list`."""
@@ -495,15 +510,342 @@ def cmd_upload_staged(args):
     else:
         _do_staged_upload(args.model_name, args.path, args.task, args.device, args.description, args.no_wait)
 
+# -- Foundry Local service helpers ------------------------------------------------
+
+def _fl_get(path, **kw):
+    """GET request to the Foundry Local service."""
+    r = requests.get(f"{FL_URL}{path}", timeout=kw.pop("timeout", 30), **kw)
+    r.raise_for_status()
+    return r
+
+def _fl_post(path, **kw):
+    """POST request to the Foundry Local service."""
+    r = requests.post(f"{FL_URL}{path}", timeout=kw.pop("timeout", 300), **kw)
+    r.raise_for_status()
+    return r
+
+def _fl_health():
+    """Check if Foundry Local service is running."""
+    try:
+        r = requests.get(f"{FL_URL}/openai/models", timeout=5)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def _fl_ensure_service(silent=False):
+    """Ensure Foundry Local service is running. Auto-starts it if not.
+    Returns True if service is healthy, False if it cannot be started."""
+    if _fl_health():
+        return True
+    # Try to auto-start
+    import shutil, subprocess
+    foundry = shutil.which("foundry") or shutil.which("foundry.exe")
+    if not foundry:
+        if not silent:
+            print("  [ERROR] Foundry Local service is not running and `foundry` CLI not found.")
+            print("  Install from: https://learn.microsoft.com/azure/ai-foundry/foundry-local/get-started")
+        return False
+    if not silent:
+        print("  Foundry Local service not running. Starting...")
+    try:
+        subprocess.Popen(
+            [foundry, "service", "start"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        )
+    except Exception as e:
+        if not silent:
+            print(f"  [ERROR] Failed to start service: {e}")
+        return False
+    # Wait for service to be ready (up to 30 seconds)
+    for i in range(30):
+        time.sleep(1)
+        if _fl_health():
+            if not silent:
+                print(f"  ✓ Foundry Local service started ({i+1}s)")
+            return True
+        if not silent and i % 5 == 4:
+            print(f"    Waiting... ({i+1}s)")
+    if not silent:
+        print("  [ERROR] Foundry Local service did not start within 30 seconds.")
+    return False
+
+def _fl_list_models():
+    """List all models from FL service catalog (via /v1/models OpenAI-compatible endpoint)."""
+    try:
+        r = _fl_get("/v1/models")
+        return r.json().get("data", [])
+    except Exception:
+        return []
+
+def _fl_cached_models():
+    """Get locally cached model IDs using `foundry cache list`."""
+    import shutil, subprocess
+    foundry = shutil.which("foundry") or shutil.which("foundry.exe")
+    if not foundry:
+        return set()
+    try:
+        proc = subprocess.run(
+            [foundry, "cache", "list"], capture_output=True, text=True, timeout=15
+        )
+        # Parse the tabular output -- lines starting with 💾 have cached models
+        cached = set()
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("\U0001f4be"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    # Last token is the model ID
+                    cached.add(parts[-1])
+        return cached
+    except Exception:
+        return set()
+
+def _fl_load_model(model_id):
+    """Load a model in FL service. Returns True on success."""
+    try:
+        r = _fl_get(f"/openai/load/{model_id}", timeout=120)
+        return r.status_code == 200
+    except Exception as e:
+        print(f"  [ERROR] Load failed: {e}")
+        return False
+
+def _fl_unload_model(model_id):
+    """Unload a model from FL service. Falls back to foundry CLI."""
+    import shutil, subprocess
+    # Try API first
+    try:
+        r = _fl_get(f"/openai/unload/{model_id}", timeout=30)
+        if r.status_code == 200:
+            return True
+    except Exception:
+        pass
+    # Fallback: use foundry CLI
+    foundry = shutil.which("foundry") or shutil.which("foundry.exe")
+    if foundry:
+        try:
+            proc = subprocess.run(
+                [foundry, "model", "unload", model_id],
+                capture_output=True, text=True, timeout=30
+            )
+            if proc.returncode == 0:
+                return True
+            print(f"  [ERROR] foundry model unload: {proc.stderr.strip() or proc.stdout.strip()}")
+        except Exception as e:
+            print(f"  [ERROR] Unload failed: {e}")
+    else:
+        print(f"  [ERROR] Unload API returned error and `foundry` CLI not found.")
+    return False
+
+def _fl_chat_stream(model_id, messages, temperature=0.7, max_tokens=800):
+    """Stream a chat completion from FL service. Yields content chunks."""
+    body = {
+        "model": model_id,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+    r = requests.post(f"{FL_URL}/v1/chat/completions", json=body, stream=True, timeout=300)
+    r.raise_for_status()
+    for line in r.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data: "):
+            continue
+        payload = line[6:]
+        if payload.strip() == "[DONE]":
+            break
+        try:
+            chunk = json.loads(payload)
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            content = delta.get("content", "")
+            if content:
+                yield content
+        except json.JSONDecodeError:
+            pass
+
+def _fl_chat(model_id, messages, temperature=0.7, max_tokens=800):
+    """Non-streaming chat completion from FL service."""
+    body = {
+        "model": model_id,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    r = _fl_post("/v1/chat/completions", json=body, timeout=300)
+    return r.json()
+
+
+# -- FL CLI commands --------------------------------------------------------------
+
+def cmd_cache(args):
+    """Show models available in the Foundry Local cache."""
+    if not _fl_ensure_service():
+        sys.exit(1)
+    models = _fl_list_models()           # /v1/models → list of dicts
+    cached_ids = _fl_cached_models()     # foundry cache list → set of model ID strings
+    print(f"\nFoundry Local Service: {FL_URL}")
+    if models:
+        cached = [m for m in models if m.get("id", "") in cached_ids]
+        remote = [m for m in models if m.get("id", "") not in cached_ids]
+        if cached:
+            print(f"\n  Cached models ({len(cached)}) — ready to load & run:")
+            for m in cached:
+                mid = m.get("id", "?")
+                max_in = m.get("maxInputTokens", "")
+                max_out = m.get("maxOutputTokens", "")
+                tool = "✓" if m.get("toolCalling") else " "
+                print(f"    💾 {mid:<50} tokens={max_in}/{max_out}  tool={tool}")
+        if remote:
+            print(f"\n  Available remotely ({len(remote)}) — need download:")
+            for m in remote[:10]:
+                print(f"    ○ {m.get('id', '?')}")
+            if len(remote) > 10:
+                print(f"    ... and {len(remote)-10} more")
+    else:
+        print("  No models found. Is the service running?")
+    if not cached_ids:
+        print("\n  No cached models. Download one first:")
+        print("    mds download-fl <model-name>")
+
+def cmd_load(args):
+    """Load a model in the Foundry Local service."""
+    if not _fl_ensure_service():
+        sys.exit(1)
+    model_id = args.model_name
+    print(f"  Loading '{model_id}'...")
+    if _fl_load_model(model_id):
+        print(f"  ✓ Model '{model_id}' loaded and ready.")
+    else:
+        sys.exit(1)
+
+def cmd_unload(args):
+    """Unload a model from the Foundry Local service."""
+    if not _fl_ensure_service():
+        sys.exit(1)
+    model_id = args.model_name
+    print(f"  Unloading '{model_id}'...")
+    if _fl_unload_model(model_id):
+        print(f"  ✓ Model '{model_id}' unloaded.")
+    else:
+        sys.exit(1)
+
+def cmd_run(args):
+    """Interactive chat with a Foundry Local model (REPL)."""
+    if not _fl_ensure_service():
+        sys.exit(1)
+
+    model_id = args.model_name
+    temperature = getattr(args, "temperature", 0.7) or 0.7
+    max_tokens = getattr(args, "max_tokens", 800) or 800
+    system_prompt = getattr(args, "system", None)
+    no_stream = getattr(args, "no_stream", False)
+
+    # Load the model (idempotent -- FL handles already-loaded case)
+    print(f"  Loading '{model_id}'...")
+    if not _fl_load_model(model_id):
+        print(f"  [ERROR] Failed to load model. Is it downloaded?")
+        print(f"  Try: mds download-fl {model_id}"); sys.exit(1)
+    print(f"  ✓ Loaded.")
+
+    print(f"\n{'='*60}")
+    print(f"  Chat with: {model_id}")
+    print(f"  Temperature: {temperature}  Max tokens: {max_tokens}")
+    print(f"  Type 'exit' or 'quit' to end. Ctrl+C to abort.")
+    print(f"{'='*60}\n")
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+        print(f"  [system] {system_prompt}\n")
+
+    while True:
+        try:
+            user_input = input("You> ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n  Goodbye!"); break
+        if not user_input:
+            continue
+        if user_input.lower() in ("exit", "quit", "/exit", "/quit"):
+            print("  Goodbye!"); break
+        if user_input.lower() in ("/clear", "/reset"):
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            print("  [conversation cleared]\n"); continue
+        if user_input.lower() == "/help":
+            print("  Commands: /clear /reset /help /exit /quit")
+            print(f"  Model: {model_id}  Temp: {temperature}  MaxTokens: {max_tokens}\n")
+            continue
+
+        messages.append({"role": "user", "content": user_input})
+        print(f"\n{model_id}> ", end="", flush=True)
+
+        try:
+            if no_stream:
+                resp = _fl_chat(model_id, messages, temperature, max_tokens)
+                content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+                print(content)
+                messages.append({"role": "assistant", "content": content})
+            else:
+                full_response = []
+                for chunk in _fl_chat_stream(model_id, messages, temperature, max_tokens):
+                    print(chunk, end="", flush=True)
+                    full_response.append(chunk)
+                print()
+                messages.append({"role": "assistant", "content": "".join(full_response)})
+        except requests.HTTPError as e:
+            print(f"\n  [ERROR] {e.response.status_code}: {e.response.text[:200]}")
+            messages.pop()  # remove failed user message
+        except Exception as e:
+            print(f"\n  [ERROR] {e}")
+            messages.pop()
+        print()
+
+def cmd_chat(args):
+    """One-shot chat with a Foundry Local model (non-interactive)."""
+    if not _fl_ensure_service():
+        sys.exit(1)
+
+    model_id = args.model_name
+    prompt = args.prompt
+    temperature = getattr(args, "temperature", 0.7) or 0.7
+    max_tokens = getattr(args, "max_tokens", 800) or 800
+    system_prompt = getattr(args, "system", None)
+    no_stream = getattr(args, "no_stream", False)
+
+    # Load if needed (idempotent)
+    print(f"  Loading '{model_id}'...", file=sys.stderr)
+    if not _fl_load_model(model_id):
+        print(f"  [ERROR] Failed to load model.", file=sys.stderr); sys.exit(1)
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    if no_stream:
+        resp = _fl_chat(model_id, messages, temperature, max_tokens)
+        content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+        print(content)
+    else:
+        for chunk in _fl_chat_stream(model_id, messages, temperature, max_tokens):
+            print(chunk, end="", flush=True)
+        print()
+
+
 # -- Interactive helpers ----------------------------------------------------------
 
-def _pick(title, options):
+def _pick(title, options, allow_back=False):
     print(f"\n  {title}")
+    if allow_back: print("    [0] Back")
     for i, o in enumerate(options, 1): print(f"    [{i}] {o}")
     while True:
         v = input("  > ").strip()
+        if allow_back and v == "0": return 0, None
         if v.isdigit() and 1 <= int(v) <= len(options): return int(v), options[int(v)-1]
-        print(f"  Enter 1-{len(options)}")
+        lo = 0 if allow_back else 1
+        print(f"  Enter {lo}-{len(options)}")
 
 def _fetch_models():
     try:
@@ -582,24 +924,43 @@ def _interactive():
         idx, _ = _pick("Action", [
             "List models       (choose source: MDS or Foundry Local)",
             "Download a model  (choose source: MDS or Foundry Local)",
+            "Run a model       (interactive chat with Foundry Local)",
             "Upload a model    (MDS blob storage)",
+            "Model cache       (show cached/loaded FL models)",
             "View model details (MDS)",
             "Sync report       (MDS registry vs blob)",
             "Exit",
         ])
         try:
-            if idx == 6: print("\n  Goodbye!"); break
-            elif idx == 5: cmd_sync(None)
-            elif idx == 4:
-                _, name = _pick("Model", [m["name"] for m in models]) if models else (0, input("  Model name: ").strip())
+            if idx == 8: print("\n  Goodbye!"); break
+            elif idx == 7: cmd_sync(None)
+            elif idx == 6:
+                if models:
+                    idx_d, name = _pick("Model", [m["name"] for m in models], allow_back=True)
+                    if idx_d == 0: continue
+                else:
+                    name = input("  Model name: ").strip()
+                    if not name: continue
                 cmd_info(argparse.Namespace(model_name=name, version=None))
-            elif idx == 3: _interactive_upload()
+            elif idx == 5: cmd_cache(argparse.Namespace())
+            elif idx == 4: _interactive_upload()
+            elif idx == 3:
+                src, _ = _pick("Run from which source?", [
+                    "MDS Private Models  (downloaded to local folder)",
+                    "Foundry Local       (cached models, FL service)",
+                ], allow_back=True)
+                if src == 0: continue
+                elif src == 1:
+                    _interactive_run_mds(models)
+                else:
+                    _interactive_run()
             elif idx == 1:  # List
                 src, _ = _pick("List from which source?", [
                     "MDS Private Models  (your blob storage, requires JWT)",
                     "Foundry Local       (public Microsoft catalog, 107+ models)",
-                ])
-                if src == 1:
+                ], allow_back=True)
+                if src == 0: continue
+                elif src == 1:
                     models, reg = _fetch_models(); _show_models(models, reg)
                 else:
                     cmd_list_fl(None)
@@ -607,8 +968,9 @@ def _interactive():
                 src, _ = _pick("Download from which source?", [
                     "MDS Private Models  (your blob storage, requires JWT)",
                     "Foundry Local       (public Microsoft catalog, uses foundry CLI)",
-                ])
-                if src == 1:
+                ], allow_back=True)
+                if src == 0: continue
+                elif src == 1:
                     if not models: models, reg = _fetch_models(); _show_models(models, reg)
                     _interactive_download(models)
                 else:
@@ -632,27 +994,379 @@ def _interactive_download_fl():
     if not name: print("  Cancelled."); return
     print(f"\n  Downloading '{name}' via Foundry Local CLI...")
     proc = subprocess.run([foundry, "model", "download", name], check=False)
-    if proc.returncode == 0:
-        print(f"\n  Done! Run:  foundry model run {name}")
-    else:
+    if proc.returncode != 0:
         print(f"\n  [ERROR] Download failed (exit code {proc.returncode})")
+        return
+    print(f"\n  ✓ Model '{name}' is now cached locally.")
+    # Offer to run immediately
+    try:
+        run_now = input("\n  Run this model now? [Y/n]: ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        return
+    if run_now == "n": return
+    if not _fl_ensure_service():
+        print("  Cannot start service. Start manually: foundry service start")
+        return
+    _run_chat_session(name)
+
+def _build_inference_model_json(model_dir, model_alias, registry_tags=None):
+    """Build an inference_model.json for FL from the model's config files.
+
+    FL requires this file to know the prompt template and model name.
+
+    Resolution order for the prompt template:
+      1. `promptTemplate` tag from the MDS registry (set during upload)
+      2. Detection from tokenizer_config.json special tokens (im_start/im_end etc.)
+      3. Detection from genai_config.json / config.json model type field
+      4. Default: ChatML (most common format)
+    """
+    import json as _json
+    model_dir = Path(model_dir)
+    registry_tags = registry_tags or {}
+
+    # --- Known prompt templates ---
+    CHATML = {
+        "system": "<|im_start|>system\n{Content}<|im_end|>",
+        "user":   "<|im_start|>user\n{Content}<|im_end|>",
+        "assistant": "<|im_start|>assistant\n{Content}<|im_end|>",
+        "prompt": "<|im_start|>user\n{Content}<|im_end|>\n<|im_start|>assistant",
+    }
+    PHI = {
+        "system": "<|system|>\n{Content}<|end|>",
+        "user":   "<|user|>\n{Content}<|end|>",
+        "assistant": "<|assistant|>\n{Content}<|end|>",
+        "prompt": "<|user|>\n{Content}<|end|>\n<|assistant|>",
+    }
+    LLAMA = {
+        "system": "<|start_header_id|>system<|end_header_id|>\n\n{Content}<|eot_id|>",
+        "user":   "<|start_header_id|>user<|end_header_id|>\n\n{Content}<|eot_id|>",
+        "assistant": "<|start_header_id|>assistant<|end_header_id|>\n\n{Content}<|eot_id|>",
+        "prompt": "<|start_header_id|>user<|end_header_id|>\n\n{Content}<|eot_id|><|start_header_id|>assistant<|end_header_id|>",
+    }
+
+    template = None
+
+    # --- 1. Use promptTemplate from MDS registry tags (most authoritative) ---
+    pt_tag = registry_tags.get("promptTemplate", "")
+    if pt_tag:
+        try:
+            template = _json.loads(pt_tag) if isinstance(pt_tag, str) else pt_tag
+        except (_json.JSONDecodeError, TypeError):
+            pass
+
+    # --- 2. Detect from tokenizer_config.json special tokens ---
+    if not template:
+        tok_path = model_dir / "tokenizer_config.json"
+        if tok_path.exists():
+            try:
+                tok = _json.loads(tok_path.read_text(encoding="utf-8"))
+                added = tok.get("added_tokens_decoder", {})
+                token_contents = {v.get("content", "") for v in added.values() if isinstance(v, dict)}
+                if "<|im_start|>" in token_contents and "<|im_end|>" in token_contents:
+                    template = CHATML
+                elif "<|system|>" in token_contents and "<|end|>" in token_contents:
+                    template = PHI
+                elif "<|start_header_id|>" in token_contents and "<|eot_id|>" in token_contents:
+                    template = LLAMA
+            except Exception:
+                pass
+
+    # --- 3. Detect from genai_config.json / config.json model type ---
+    if not template:
+        model_type = None
+        genai_path = model_dir / "genai_config.json"
+        config_path = model_dir / "config.json"
+        if genai_path.exists():
+            try:
+                gc = _json.loads(genai_path.read_text(encoding="utf-8"))
+                model_type = gc.get("model", {}).get("type", "").lower()
+            except Exception:
+                pass
+        if not model_type and config_path.exists():
+            try:
+                cc = _json.loads(config_path.read_text(encoding="utf-8"))
+                model_type = cc.get("model_type", "").lower()
+            except Exception:
+                pass
+
+        template_map = {
+            "qwen": CHATML, "qwen2": CHATML, "qwen3": CHATML,
+            "phi": PHI, "phi3": PHI, "phi4": PHI,
+            "llama": LLAMA, "llama2": LLAMA, "llama3": LLAMA,
+            "mistral": CHATML, "gemma": CHATML,
+        }
+        if model_type:
+            for key, tmpl in template_map.items():
+                if key in model_type:
+                    template = tmpl; break
+
+    # --- 4. Default: ChatML ---
+    if not template:
+        template = CHATML
+
+    return {
+        "Name": model_alias,
+        "PromptTemplate": template,
+    }
+
+
+def _fetch_model_tags(model_name):
+    """Fetch FL tags for a model from the MDS registry. Returns dict or {}."""
+    try:
+        r = requests.get(f"{BASE_URL}/models/{model_name}", headers=_headers(), timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            # Tags may be at top level or under 'tags' key depending on API
+            return data.get("tags", data.get("properties", {}).get("tags", {}))
+    except Exception:
+        pass
+    return {}
+
+
+def _sideload_to_fl_cache(model_name, model_dir, registry_tags=None):
+    """Sideload a local model folder into the FL cache so `foundry model load` can find it.
+
+    Creates a symlink (or copies files) into:
+      ~/.foundry/cache/models/MDS/{model_name}/v1/
+
+    Returns the alias string like 'mds-{model_name}:1' or None on failure.
+    """
+    import json as _json, shutil
+    model_dir = Path(model_dir).resolve()
+    alias = f"mds-{model_name}:1"
+
+    # Find FL cache root
+    cache_root = Path.home() / ".foundry" / "cache" / "models" / "MDS" / model_name / "v1"
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    # Check if already sideloaded with same files
+    marker = cache_root / ".mds_sideloaded"
+    if marker.exists():
+        try:
+            meta = _json.loads(marker.read_text(encoding="utf-8"))
+            if meta.get("source") == str(model_dir):
+                print(f"  Already sideloaded: {alias}")
+                return alias
+        except Exception:
+            pass
+
+    print(f"  Sideloading '{model_name}' into FL cache...")
+    print(f"    Source: {model_dir}")
+    print(f"    Cache:  {cache_root}")
+
+    # Copy model files (skip huge .onnx.data -- symlink it instead)
+    for src_file in model_dir.iterdir():
+        if not src_file.is_file():
+            continue
+        dst_file = cache_root / src_file.name
+        if dst_file.exists():
+            # Skip if same size (already copied)
+            if dst_file.stat().st_size == src_file.stat().st_size:
+                continue
+            dst_file.unlink()
+
+        if src_file.stat().st_size > 100 * 1024 * 1024:  # >100MB: symlink
+            try:
+                dst_file.symlink_to(src_file)
+                print(f"    ↗ {src_file.name}  (symlink)")
+            except OSError:
+                # Symlink failed (no privileges) -- copy instead
+                print(f"    ⟳ {src_file.name}  ({_human(src_file.stat().st_size)}, copying...)")
+                shutil.copy2(src_file, dst_file)
+        else:
+            shutil.copy2(src_file, dst_file)
+            print(f"    ✓ {src_file.name}")
+
+    # Generate inference_model.json if missing
+    inf_path = cache_root / "inference_model.json"
+    if not inf_path.exists():
+        inf_model = _build_inference_model_json(model_dir, alias, registry_tags)
+        inf_path.write_text(_json.dumps(inf_model, indent=2), encoding="utf-8")
+        print(f"    ✓ inference_model.json  (generated)")
+
+    # Write sideload marker
+    marker.write_text(_json.dumps({
+        "source": str(model_dir),
+        "alias": alias,
+        "model_name": model_name,
+    }, indent=2), encoding="utf-8")
+
+    print(f"  Sideloaded as: {alias}")
+    return alias
+
+
+def _interactive_run_mds(models):
+    """Interactive flow for running a model downloaded from MDS via Foundry Local.
+
+    Algorithm (mirrors FL SDK):
+      1. Pick an MDS model from the registry
+      2. Verify the model has been downloaded to a local folder
+      3. Sideload into FL cache (~/.foundry/cache/models/MDS/{name}/v1/)
+         - Copy/symlink model files
+         - Generate inference_model.json with correct prompt template
+      4. Load via `foundry model load {alias}`
+      5. Start interactive chat via FL REST API (/v1/chat/completions)
+    """
+    if not models:
+        print("\n  No MDS models loaded. Listing from server...")
+        models, _ = _fetch_models()
+    if not models:
+        print("  [ERROR] No models available."); return
+
+    idx, name = _pick("Select MDS model to run", [m["name"] for m in models], allow_back=True)
+    if idx == 0: return
+
+    # The model must have been downloaded locally -- check for a local folder
+    local_dir = Path(name)
+    if not local_dir.is_dir():
+        print(f"\n  [WARN] Local folder '{name}/' not found.")
+        print(f"  Download it first:  Action > Download > MDS > {name}")
+        return
+
+    # Verify it has ONNX model files
+    onnx_files = list(local_dir.glob("*.onnx")) + list(local_dir.glob("*.onnx.data"))
+    if not onnx_files:
+        print(f"\n  [WARN] No .onnx files found in '{name}/'. Not a runnable model.")
+        print(f"  Only ONNX GenAI models can be loaded into Foundry Local.")
+        return
+
+    # Ensure FL service is running
+    if not _fl_ensure_service():
+        print("  Cannot start FL service. Start manually: foundry service start"); return
+
+    # Fetch FL tags from MDS registry (promptTemplate, task, etc.)
+    print(f"  Fetching FL tags for '{name}' from registry...")
+    tags = _fetch_model_tags(name)
+    if tags:
+        pt = tags.get("promptTemplate", "")
+        task = tags.get("task", "")
+        print(f"    task={task or '(none)'}  promptTemplate={'yes' if pt else '(auto-detect)'}")
+    else:
+        print(f"    No registry tags found, will auto-detect from model files.")
+
+    # Sideload into FL cache
+    alias = _sideload_to_fl_cache(name, local_dir, registry_tags=tags)
+    if not alias:
+        print("  [ERROR] Sideload failed."); return
+
+    # Load via foundry CLI
+    import shutil as _shutil, subprocess as _sp
+    foundry = _shutil.which("foundry") or _shutil.which("foundry.exe")
+    if foundry:
+        print(f"\n  Loading '{alias}' into FL service...")
+        proc = _sp.run([foundry, "model", "load", alias],
+                       capture_output=True, encoding="utf-8", errors="replace")
+        if proc.returncode == 0:
+            print(f"  ✓ Model loaded: {alias}")
+        else:
+            err_msg = (proc.stderr or proc.stdout or "").strip()
+            print(f"  [WARN] foundry load returned code {proc.returncode}: {err_msg}")
+            print(f"  Trying API load...")
+            _fl_load_model(alias)
+    else:
+        print("  `foundry` CLI not found, trying API load...")
+        _fl_load_model(alias)
+
+    # Determine the actual model ID (FL may adjust the name)
+    model_id = alias
+    loaded = _fl_list_models()
+    if loaded:
+        for m in loaded:
+            mid = m.get("id", "")
+            if name.lower() in mid.lower() or alias.lower() == mid.lower():
+                model_id = mid; break
+
+    _run_chat_session(model_id)
+
+def _interactive_run():
+    """Interactive flow for running a model via Foundry Local."""
+    if not _fl_ensure_service():
+        return
+
+    # Get cached models (ready to run)
+    cached_ids = _fl_cached_models()
+    if not cached_ids:
+        # Fallback: get all model IDs from the service
+        fl_models = _fl_list_models()
+        cached_ids = {m.get("id", "") for m in fl_models} if fl_models else set()
+
+    if not cached_ids:
+        print("\n  No models available. Download one first:")
+        print("    mds download-fl <model-name>")
+        return
+
+    available = sorted(cached_ids)
+    idx, chosen = _pick("Select model to chat with", available, allow_back=True)
+    if idx == 0: return
+    model_id = chosen.strip()
+
+    _run_chat_session(model_id)
+
+def _run_chat_session(model_id):
+    """Prompt for settings and start a chat REPL with the given model."""
+    # Optional settings with explanations
+    print("\n  Chat settings (press Enter to use defaults):")
+    print("  ─────────────────────────────────────────────")
+    print("  System prompt : Sets the model's persona/behavior before the chat.")
+    print("                  e.g. 'You are a helpful coding assistant'")
+    system = input("  System prompt (Enter to skip): ").strip() or None
+    print("  Temperature   : Controls randomness. 0.0 = deterministic, 0.7 = balanced,")
+    print("                  1.0+ = creative. Keep between 0.1–1.0 for best results.")
+    temp_str = input("  Temperature [0.7]: ").strip()
+    temperature = float(temp_str) if temp_str else 0.7
+    print("  Max tokens    : Maximum response length (~1 token ≈ ¾ word).")
+    print("                  200 = short, 800 = medium, 4096 = long.")
+    max_str = input("  Max tokens [800]: ").strip()
+    max_tokens = int(max_str) if max_str else 800
+
+    # Start the chat REPL
+    cmd_run(argparse.Namespace(
+        model_name=model_id, temperature=temperature, max_tokens=max_tokens,
+        system=system, no_stream=False))
 
 def _interactive_download(models):
-    _, name = _pick("Download which model?", [m["name"] for m in models]) if models else (0, input("  Model name: ").strip())
+    if models:
+        idx, name = _pick("Download which model?", [m["name"] for m in models], allow_back=True)
+        if idx == 0: return
+    else:
+        name = input("  Model name: ").strip()
+        if not name: return
     try:
         r = requests.get(f"{BASE_URL}/models/{name}/versions", headers=_headers(), timeout=30)
         r.raise_for_status(); versions = r.json().get("versions", [])
     except Exception: versions = []
     if versions:
         labels = [f"v{v} (latest)" if i == 0 else f"v{v}" for i, v in enumerate(versions)]
-        _, chosen = _pick("Version", labels); ver = chosen.split()[0].lstrip("v")
+        idx_v, chosen = _pick("Version", labels, allow_back=True)
+        if idx_v == 0: return
+        ver = chosen.split()[0].lstrip("v")
     else:
         ver = input("  Version (blank=latest): ").strip() or None
-    _, method = _pick("Download method", [
-        "SAS URL (direct from Azure Storage -- fast)",
+    idx_m, method = _pick("Download method", [
+        "SAS URL download (direct from Azure Storage -- fast)",
+        "Show SAS URLs only (copy/paste into browser)",
         "ZIP archive (server packages all files)",
         "Parallel download (Azure SDK -- fastest for large models)",
-    ])
+    ], allow_back=True)
+    if idx_m == 0: return
+    if "Show SAS" in method:
+        print("  Fetching SAS URLs...")
+        r = requests.post(f"{BASE_URL}/download", params={"model": name, "version": ver},
+                          headers=_headers(), timeout=60)
+        r.raise_for_status(); data = r.json()
+        if "download_url" in data and "files" not in data:
+            print(f"\n  {name} v{ver} (single file):")
+            print(f"  {data['download_url']}\n")
+        else:
+            files = data.get("files", [])
+            if not files:
+                print("  [WARN] No files returned.")
+            else:
+                print(f"\n  {name} v{ver} ({len(files)} file(s)):\n")
+                for entry in files:
+                    print(f"  {entry['file']}:")
+                    print(f"    {entry['download_url']}\n")
+        return
     default = f"./{name}"
     raw = input(f"  Output dir [{default}]: ").strip().strip('"')
     out = Path(raw) if raw else Path(default)
@@ -666,11 +1380,57 @@ def _interactive_download(models):
         _download_urls(name, ver, out)
     elapsed = time.time() - t0
     print(f"  Done! Saved to: {out.resolve()}  ({elapsed:.1f}s total)")
+    # Offer to run the downloaded model
+    _offer_run_after(name, str(out.resolve()))
+
+def _offer_run_after(model_name, local_path=None):
+    """Ask the user if they want to run the model after upload/download."""
+    try:
+        run_now = input("\n  Run this model now? [Y/n]: ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        return
+    if run_now == "n": return
+    src, _ = _pick("Run from which source?", [
+        "MDS Private Models  (use local downloaded folder)",
+        "Foundry Local       (cached models, FL service)",
+    ], allow_back=True)
+    if src == 0: return
+    if src == 1:
+        if not local_path or not Path(local_path).is_dir():
+            print(f"  [WARN] Local folder not found at '{local_path}'.")
+            return
+        # Check for ONNX files
+        onnx_files = list(Path(local_path).glob("*.onnx"))
+        if not onnx_files:
+            print(f"  [WARN] No .onnx files in '{local_path}'. Not a runnable model.")
+            return
+        if not _fl_ensure_service():
+            print("  Cannot start FL service."); return
+        alias = _sideload_to_fl_cache(model_name, local_path)
+        if not alias:
+            print("  [ERROR] Sideload failed."); return
+        import shutil as _sh, subprocess as _sp
+        foundry = _sh.which("foundry") or _sh.which("foundry.exe")
+        if foundry:
+            print(f"  Loading '{alias}'...")
+            _sp.run([foundry, "model", "load", alias],
+                    capture_output=True, encoding="utf-8", errors="replace")
+        _run_chat_session(alias)
+    else:
+        if not _fl_ensure_service():
+            print("  Cannot start FL service."); return
+        cached = sorted(_fl_cached_models())
+        if not cached:
+            print("  No FL cached models available."); return
+        idx, chosen = _pick("Select model to chat with", cached, allow_back=True)
+        if idx == 0: return
+        _run_chat_session(chosen.strip())
 
 def _interactive_upload():
     name = input("  Model name: ").strip()
     if not name: return
-    idx_s, _ = _pick("Source", ["Single file", "Multiple files", "Folder"])
+    idx_s, _ = _pick("Source", ["Single file", "Multiple files", "Folder"], allow_back=True)
+    if idx_s == 0: return
     if idx_s == 1:
         path = input("  File path: ").strip().strip('"')
     elif idx_s == 2:
@@ -695,7 +1455,8 @@ def _interactive_upload():
         print(f"  Total size: {_human(total_size)} -- staged upload recommended for speed")
         default_hint = " [recommended]"
         methods[1] += default_hint; methods[2] += default_hint
-    idx_m, _ = _pick("Method", methods)
+    idx_m, _ = _pick("Method", methods, allow_back=True)
+    if idx_m == 0: return
     print("  Optional metadata (Enter to skip):")
     task = input("    Task: ").strip() or None
     device = input("    Device: ").strip() or None
@@ -709,13 +1470,21 @@ def _interactive_upload():
         for p in path: _do_upload(name, p, task, device, desc)
     else:
         _do_upload(name, path, task, device, desc)
+    # Offer to run the just-uploaded model
+    local = src if isinstance(path, str) else (path[0] if isinstance(path, list) else str(path))
+    _offer_run_after(name, local)
 
 # -- CLI entry point --------------------------------------------------------------
+
+def _set_fl_url(url):
+    global FL_URL
+    FL_URL = url
 
 def main():
     p = argparse.ArgumentParser(prog="mds", description="MDS SDK Client",
                                 epilog="Run without arguments for interactive demo mode.")
     p.add_argument("--base-url", default=BASE_URL, help="MDS server URL")
+    p.add_argument("--fl-url", default=FL_URL, help="Foundry Local service URL")
     sub = p.add_subparsers(dest="command")
     sub.add_parser("list", help="List models")
     sub.add_parser("sync", help="Sync report: registry vs blob")
@@ -728,6 +1497,25 @@ def main():
     sub.add_parser("list-fl", help="List Foundry Local public catalog models")
     fl_dl = sub.add_parser("download-fl", help="Download from Foundry Local public catalog")
     fl_dl.add_argument("model_name", help="Model name or alias (e.g. phi-4-mini)")
+    # FL run/chat/cache/load/unload commands
+    rp = sub.add_parser("run", help="Interactive chat with a Foundry Local model")
+    rp.add_argument("model_name", help="Model name or ID")
+    rp.add_argument("--temperature", "-t", type=float, default=0.7, help="Sampling temperature")
+    rp.add_argument("--max-tokens", type=int, default=800, help="Max response tokens")
+    rp.add_argument("--system", "-s", default=None, help="System prompt")
+    rp.add_argument("--no-stream", action="store_true", help="Disable streaming")
+    chp = sub.add_parser("chat", help="One-shot chat with a Foundry Local model")
+    chp.add_argument("model_name", help="Model name or ID")
+    chp.add_argument("prompt", help="User message")
+    chp.add_argument("--temperature", "-t", type=float, default=0.7)
+    chp.add_argument("--max-tokens", type=int, default=800)
+    chp.add_argument("--system", "-s", default=None, help="System prompt")
+    chp.add_argument("--no-stream", action="store_true")
+    sub.add_parser("cache", help="Show cached/loaded Foundry Local models")
+    lp = sub.add_parser("load", help="Load a model in Foundry Local")
+    lp.add_argument("model_name", help="Model name or ID")
+    ulp = sub.add_parser("unload", help="Unload a model from Foundry Local")
+    ulp.add_argument("model_name", help="Model name or ID")
     dp = sub.add_parser("download", help="Download model"); dp.add_argument("model_name")
     dp.add_argument("--version", "-v", default=None); dp.add_argument("--output", "-o", default=None)
     dp.add_argument("--format", "-f", choices=["urls", "zip"], default="urls")
@@ -740,10 +1528,13 @@ def main():
     sp.add_argument("--method", choices=["azcopy", "sdk"], default="azcopy", help="Upload method: azcopy (default) or sdk")
     args = p.parse_args()
     if args.base_url != BASE_URL: _set_base_url(args.base_url)
+    if args.fl_url != FL_URL: _set_fl_url(args.fl_url)
     if not args.command: _interactive(); return
     cmds = {"list": cmd_list, "sync": cmd_sync, "info": cmd_info, "catalog": cmd_catalog,
             "catalog-fl": cmd_catalog_fl, "list-fl": cmd_list_fl, "download-fl": cmd_download_fl,
-            "download": cmd_download, "upload": cmd_upload, "upload-staged": cmd_upload_staged}
+            "download": cmd_download, "upload": cmd_upload, "upload-staged": cmd_upload_staged,
+            "run": cmd_run, "chat": cmd_chat, "cache": cmd_cache,
+            "load": cmd_load, "unload": cmd_unload}
     try: cmds[args.command](args)
     except requests.HTTPError as e: print(f"\n[ERROR] HTTP {e.response.status_code}: {e.response.text[:300]}"); sys.exit(1)
     except KeyboardInterrupt: print("\nCancelled."); sys.exit(130)

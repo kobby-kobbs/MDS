@@ -14,7 +14,7 @@ from .azure_clients import (REGISTRY_NAME, STORAGE_ACCOUNT, download_blob, gener
                              generate_upload_sas_url, get_ml_client, list_blob_prefixes, list_blobs, upload_to_blob)
 from .catalog import CatalogRequest, FLCatalogQuery, build_foundry_model, decode_continuation_token, encode_continuation_token
 from .customers import get_customer_by_api_key, get_customer_registry, get_customer_storage
-from .metadata import extract_onnx_metadata
+from .metadata import build_fl_description, extract_metadata_from_files, extract_onnx_metadata
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("mds")
@@ -104,14 +104,29 @@ def _build_upload_tags(claims: dict, auto_tags: dict, **ov) -> dict:
     return tags
 
 
-def _register_model(model_name: str, description: str, tags: dict, *, customer_id: str = None) -> str:
+def _register_model(model_name: str, description: str, tags: dict, *,
+                    customer_id: str = None, model_path: str = None) -> str:
+    """Register a model in the Azure ML registry.
+
+    Args:
+        model_path: Optional path to a directory or file containing the actual
+                    model artifacts. When provided, the model is registered with
+                    real files so the azureml:// URI resolves for FL downloads.
+                    Falls back to a placeholder file when None.
+    """
     ml, _ = _client_for(customer_id)
-    temp = UPLOAD_DIR / f"placeholder_{model_name}.txt"
-    temp.write_text(f"Model: {model_name}")
+    cleanup_placeholder = False
+    if model_path:
+        reg_path = model_path
+    else:
+        temp = UPLOAD_DIR / f"placeholder_{model_name}.txt"
+        temp.write_text(f"Model: {model_name}")
+        reg_path = str(temp)
+        cleanup_placeholder = True
     try:
         for attempt in range(1, 4):
             try:
-                m = Model(path=str(temp), name=model_name, type="custom_model",
+                m = Model(path=reg_path, name=model_name, type="custom_model",
                           description=description, tags=tags)
                 reg = ml.models.create_or_update(m)
                 _invalidate_model_caches()
@@ -123,7 +138,8 @@ def _register_model(model_name: str, description: str, tags: dict, *, customer_i
                 else:
                     raise
     finally:
-        temp.unlink(missing_ok=True)
+        if cleanup_placeholder:
+            temp.unlink(missing_ok=True)
 
 
 def _is_archive(fn: str) -> bool:
@@ -529,10 +545,13 @@ async def upload(
     nv = _next_ver(model_name, cid)
     blob_prefix = f"{model_name}/v{nv}"
     uploaded, total_bytes, file_entries = [], 0, []
+    archive_tags: dict = {}  # metadata from archive-level extraction
     for f in files:
         content = await f.read()
         fname = f.filename or "file"
         if _is_archive(fname):
+            # Extract rich metadata from the archive BEFORE unpacking
+            archive_tags.update(extract_onnx_metadata(content, fname))
             entries = _extract_archive(content, fname)
             if entries:
                 stripped = _strip_common_prefix([e[0] for e in entries])
@@ -541,23 +560,41 @@ async def upload(
                 file_entries.append((fname, content))
         else:
             file_entries.append((fname, content))
-    first_content, first_filename = b"", ""
-    for rel, data in file_entries:
-        bn = f"{blob_prefix}/{rel}"
-        upload_to_blob(data, bn, storage_account=sa)
-        uploaded.append(bn)
-        total_bytes += len(data)
-        if not first_content:
-            first_content, first_filename = data, rel
-    auto_tags = extract_onnx_metadata(first_content, first_filename)
-    _l = locals()
-    meta = {k: _l.get(k, "") for k in _FIELD_TO_TAG if k in _l}
-    multi = len(uploaded) > 1
-    tags = _build_upload_tags(
-        claims, auto_tags, blob_name=uploaded[0] if not multi else "",
-        blob_prefix=blob_prefix if multi else "", blob_files=",".join(uploaded) if multi else "",
-        blob_count=len(uploaded), total_bytes=total_bytes, model_name=model_name, **meta)
-    version = _register_model(model_name, description, tags, customer_id=cid)
+    # For multi-file (non-archive) uploads, scan config files for metadata
+    if not archive_tags:
+        archive_tags = extract_metadata_from_files(
+            {name: data for name, data in file_entries})
+    # Stage files to temp directory for registry artifacts + upload to blob
+    staging_dir = Path(tempfile.mkdtemp(prefix="mds_reg_"))
+    try:
+        first_content, first_filename = b"", ""
+        for rel, data in file_entries:
+            # Upload to blob storage
+            bn = f"{blob_prefix}/{rel}"
+            upload_to_blob(data, bn, storage_account=sa)
+            uploaded.append(bn)
+            total_bytes += len(data)
+            if not first_content:
+                first_content, first_filename = data, rel
+            # Stage to temp directory for registry artifacts
+            staged = staging_dir / rel
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            staged.write_bytes(data)
+        auto_tags = archive_tags or extract_onnx_metadata(first_content, first_filename)
+        _l = locals()
+        meta = {k: _l.get(k, "") for k in _FIELD_TO_TAG if k in _l}
+        multi = len(uploaded) > 1
+        tags = _build_upload_tags(
+            claims, auto_tags, blob_name=uploaded[0] if not multi else "",
+            blob_prefix=blob_prefix if multi else "", blob_files=",".join(uploaded) if multi else "",
+            blob_count=len(uploaded), total_bytes=total_bytes, model_name=model_name, **meta)
+        # Auto-generate FL description if none provided
+        desc = description or build_fl_description(model_name, tags)
+        version = _register_model(model_name, desc, tags, customer_id=cid,
+                                  model_path=str(staging_dir))
+    finally:
+        import shutil
+        shutil.rmtree(staging_dir, ignore_errors=True)
     log.info(f"Upload | {cid} | {model_name} v{version} | {len(uploaded)} file(s), {total_bytes} bytes")
     return {"status": "success", "model": model_name, "version": version,
             "files_uploaded": len(uploaded), "total_bytes": total_bytes}
@@ -656,7 +693,33 @@ def upload_complete(req: UploadCompleteRequest, authorization: str = Header(...)
     for k, v in meta.items():
         if v and k not in tags:
             tags[k] = v
-    version = _register_model(mn, req.description or session["description"], tags, customer_id=cid)
+    desc = req.description or session["description"] or build_fl_description(mn, tags)
+    # Download blobs to a temp directory so registry gets real artifacts
+    staging_dir = Path(tempfile.mkdtemp(prefix="mds_staged_"))
+    try:
+        for blob_name in blobs:
+            # Strip the blob_prefix to get the relative file path
+            rel = blob_name[len(session["blob_prefix"]):].lstrip("/")
+            if not rel:
+                rel = blob_name.split("/")[-1]
+            staged = staging_dir / rel
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            staged.write_bytes(download_blob(blob_name, storage_account=sa))
+        # Extract metadata from staged files for auto-tag population
+        staged_files = {}
+        for p in staging_dir.rglob("*"):
+            if p.is_file():
+                staged_files[str(p.relative_to(staging_dir))] = p.read_bytes()
+        if staged_files:
+            file_tags = extract_metadata_from_files(staged_files)
+            for k, v in file_tags.items():
+                if v and k not in tags:
+                    tags[k] = v
+        version = _register_model(mn, desc, tags, customer_id=cid,
+                                  model_path=str(staging_dir))
+    finally:
+        import shutil
+        shutil.rmtree(staging_dir, ignore_errors=True)
     log.info(f"Staged complete | {cid} | {mn} v{version} | {len(blobs)} blobs")
     _delete_session(req.session_id)
     return {"status": "success", "model": mn, "version": version, "blobs_registered": len(blobs), "blob_prefix": session["blob_prefix"]}
