@@ -6,12 +6,13 @@ from typing import List
 from cachetools import TTLCache
 from azure.ai.ml.entities import Model
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .auth import check_entitlement, require_auth
 from .azure_clients import (REGISTRY_NAME, STORAGE_ACCOUNT, download_blob, generate_sas_url,
-                             generate_upload_sas_url, get_ml_client, list_blob_prefixes, list_blobs, upload_to_blob)
+                             generate_upload_sas_url, get_ml_client, list_blob_prefixes, list_blobs, upload_to_blob,
+                             delete_blobs)
 from .catalog import CatalogRequest, FLCatalogQuery, build_foundry_model, decode_continuation_token, encode_continuation_token
 from .customers import get_customer_by_api_key, get_customer_registry, get_customer_storage
 from .metadata import build_fl_description, extract_metadata_from_files, extract_onnx_metadata
@@ -35,11 +36,13 @@ def _invalidate_model_caches():
 
 
 app = FastAPI(title="Model Distribution Service")
+_APP_START = datetime.now(timezone.utc)
+_stats = {"uploads": 0, "downloads": 0, "last_upload": None, "last_download": None}
 
 @app.exception_handler(Exception)
 async def _unhandled(request, exc):
     log.error(f"{request.method} {request.url.path}: {exc}\n{traceback.format_exc()}")
-    return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 def _client_for(cid: str = None):
     reg = get_customer_registry(cid) if cid else None
@@ -193,11 +196,113 @@ def health():
     return {"status": "ok", "registry": REGISTRY_NAME, "storage": STORAGE_ACCOUNT}
 
 @app.get("/models")
-def list_models():
-    return _cached(_model_list_cache, "all", lambda: {
+def list_models(detail: bool = Query(False)):
+    def _fetch():
+        models = []
+        for m in get_ml_client().models.list():
+            entry = {"name": m.name, "latest_version": m.latest_version}
+            if detail:
+                try:
+                    info = get_ml_client().models.get(name=m.name, version=m.latest_version)
+                    t = info.tags or {}
+                    entry.update({
+                        "task": t.get("task", ""),
+                        "device": t.get("device", ""),
+                        "model_type": t.get("modelType", ""),
+                        "size_bytes": int(t.get("file_size_bytes", 0)),
+                        "fl_ready": t.get("foundryLocal", "").lower() == "true",
+                        "author": t.get("author", ""),
+                        "upload_time": t.get("upload_time", ""),
+                    })
+                except Exception:
+                    pass
+            models.append(entry)
+        return {"registry": REGISTRY_NAME, "models": models}
+    cache_key = "all_detail" if detail else "all"
+    return _cached(_model_list_cache, cache_key, _fetch)
+
+
+@app.delete("/models/{name}")
+def delete_model(name: str, version: str = Query(None), authorization: str = Header(...)):
+    """Delete a model from the registry and optionally its blobs from storage."""
+    claims = require_auth(authorization)
+    if not check_entitlement(claims, name):
+        raise HTTPException(403, f"Not entitled to: {name}")
+    cid = claims["customer_id"]
+    ml, sa = _client_for(cid)
+
+    # Find versions to delete
+    try:
+        all_versions = list(ml.models.list(name=name))
+    except Exception:
+        raise HTTPException(404, f"Model not found: {name}")
+    if not all_versions:
+        raise HTTPException(404, f"Model not found: {name}")
+
+    versions_to_delete = []
+    if version:
+        versions_to_delete = [version]
+    else:
+        versions_to_delete = [str(v.version) for v in all_versions]
+
+    deleted_versions = []
+    blob_errors = []
+    for ver in versions_to_delete:
+        # Delete from registry
+        try:
+            ml.models.archive(name=name, version=ver)
+            deleted_versions.append(ver)
+        except Exception as e:
+            log.warning(f"Failed to archive {name} v{ver}: {e}")
+
+        # Delete blobs
+        prefix = f"{name}/v{ver}"
+        try:
+            blobs = list_blobs(prefix, storage_account=sa)
+            if blobs:
+                delete_blobs(blobs, storage_account=sa)
+        except Exception as e:
+            blob_errors.append(f"v{ver}: {e}")
+
+    _invalidate_model_caches()
+    log.info(f"Delete | {cid} | {name} | versions={deleted_versions}")
+    result = {"status": "deleted", "model": name, "versions_deleted": deleted_versions}
+    if blob_errors:
+        result["blob_warnings"] = blob_errors
+    return result
+
+
+@app.get("/status")
+def status():
+    """Service status dashboard data."""
+    now = datetime.now(timezone.utc)
+    uptime = now - _APP_START
+    days, remainder = divmod(int(uptime.total_seconds()), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _ = divmod(remainder, 60)
+
+    try:
+        models = list(get_ml_client().models.list())
+        model_count = len(models)
+    except Exception:
+        model_count = -1
+
+    return {
+        "status": "ok",
+        "uptime": f"{days}d {hours}h {minutes}m",
+        "uptime_seconds": int(uptime.total_seconds()),
+        "started_at": _APP_START.isoformat(),
         "registry": REGISTRY_NAME,
-        "models": [{"name": m.name, "latest_version": m.latest_version} for m in get_ml_client().models.list()],
-    })
+        "storage": STORAGE_ACCOUNT,
+        "model_count": model_count,
+        "stats": _stats,
+    }
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    """Live HTML dashboard — opens in any browser."""
+    return HTMLResponse(_DASHBOARD_HTML)
 
 
 @app.get("/models/sync")
@@ -251,6 +356,7 @@ def download(model: str = Query(...), version: str = Query(...),
         raise HTTPException(404, f"Model not found: {model} v{version}")
     tags = info.tags or {}
     log.info(f"Download | {cid} | {model} v{version} | format={format}")
+    _stats["downloads"] += 1; _stats["last_download"] = datetime.now(timezone.utc).isoformat()
     bp, bf, bs = tags.get("blob_prefix", ""), tags.get("blob_files", ""), tags.get("blob_name", "")
     if bp or bf:
         blob_names = [b.strip() for b in bf.split(",") if b.strip()] if bf else list_blobs(bp, storage_account=sa)
@@ -596,6 +702,7 @@ async def upload(
         import shutil
         shutil.rmtree(staging_dir, ignore_errors=True)
     log.info(f"Upload | {cid} | {model_name} v{version} | {len(uploaded)} file(s), {total_bytes} bytes")
+    _stats["uploads"] += 1; _stats["last_upload"] = datetime.now(timezone.utc).isoformat()
     return {"status": "success", "model": model_name, "version": version,
             "files_uploaded": len(uploaded), "total_bytes": total_bytes}
 
@@ -721,5 +828,77 @@ def upload_complete(req: UploadCompleteRequest, authorization: str = Header(...)
         import shutil
         shutil.rmtree(staging_dir, ignore_errors=True)
     log.info(f"Staged complete | {cid} | {mn} v{version} | {len(blobs)} blobs")
+    _stats["uploads"] += 1; _stats["last_upload"] = datetime.now(timezone.utc).isoformat()
     _delete_session(req.session_id)
     return {"status": "success", "model": mn, "version": version, "blobs_registered": len(blobs), "blob_prefix": session["blob_prefix"]}
+
+
+# ─── Dashboard HTML ─────────────────────────────────────────────────────
+_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MDS Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#0f1117;color:#e4e4e7}
+.header{background:linear-gradient(135deg,#1e3a5f,#0d9488);padding:2rem;text-align:center}
+.header h1{font-size:1.8rem;font-weight:600;letter-spacing:-.02em}
+.header p{color:#94a3b8;margin-top:.3rem;font-size:.9rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem;padding:1.5rem;max-width:1200px;margin:0 auto}
+.card{background:#1e1e2e;border-radius:12px;padding:1.5rem;border:1px solid #2e2e3e;transition:border-color .2s}
+.card:hover{border-color:#0d9488}
+.card .label{font-size:.75rem;text-transform:uppercase;letter-spacing:.08em;color:#71717a;margin-bottom:.5rem}
+.card .value{font-size:2rem;font-weight:700;color:#f4f4f5}
+.card .sub{font-size:.8rem;color:#a1a1aa;margin-top:.3rem}
+.card.ok .value{color:#34d399} .card.warn .value{color:#fbbf24}
+.models-section{max-width:1200px;margin:0 auto;padding:0 1.5rem 2rem}
+.models-section h2{font-size:1.1rem;margin-bottom:1rem;color:#a1a1aa}
+table{width:100%;border-collapse:collapse;background:#1e1e2e;border-radius:12px;overflow:hidden;border:1px solid #2e2e3e}
+th{background:#16161e;padding:.75rem 1rem;text-align:left;font-size:.75rem;text-transform:uppercase;letter-spacing:.08em;color:#71717a}
+td{padding:.65rem 1rem;border-top:1px solid #2e2e3e;font-size:.85rem}
+tr:hover td{background:#262636}
+.badge{display:inline-block;padding:2px 8px;border-radius:9999px;font-size:.7rem;font-weight:600}
+.badge-green{background:#064e3b;color:#34d399} .badge-blue{background:#1e3a5f;color:#60a5fa}
+.badge-gray{background:#27272a;color:#a1a1aa}
+.refresh{text-align:center;padding:1rem;color:#52525b;font-size:.8rem}
+#error{display:none;text-align:center;padding:1rem;color:#f87171}
+</style></head><body>
+<div class="header"><h1>Model Distribution Service</h1><p>Private Model Registry &amp; Distribution</p></div>
+<div class="grid">
+  <div class="card ok" id="c-status"><div class="label">Status</div><div class="value" id="v-status">—</div><div class="sub" id="v-uptime"></div></div>
+  <div class="card" id="c-models"><div class="label">Models</div><div class="value" id="v-models">—</div><div class="sub" id="v-registry"></div></div>
+  <div class="card" id="c-uploads"><div class="label">Uploads</div><div class="value" id="v-uploads">—</div><div class="sub" id="v-last-upload">—</div></div>
+  <div class="card" id="c-downloads"><div class="label">Downloads</div><div class="value" id="v-downloads">—</div><div class="sub" id="v-last-download">—</div></div>
+</div>
+<div class="models-section"><h2>Registered Models</h2>
+  <table><thead><tr><th>Name</th><th>Version</th><th>Task</th><th>Device</th><th>Type</th><th>Size</th><th>FL</th></tr></thead>
+  <tbody id="model-rows"><tr><td colspan="7" style="text-align:center;color:#52525b">Loading…</td></tr></tbody></table>
+</div>
+<div class="refresh">Auto-refreshes every 30s · <span id="last-refresh"></span></div>
+<div id="error"></div>
+<script>
+const BASE=window.location.origin;
+function fmt(b){if(!b||b<=0)return'—';if(b>1e9)return(b/1e9).toFixed(1)+'GB';if(b>1e6)return(b/1e6).toFixed(1)+'MB';if(b>1e3)return(b/1e3).toFixed(1)+'KB';return b+'B'}
+function ago(iso){if(!iso)return'—';const d=new Date(iso),n=Date.now(),s=Math.floor((n-d)/1000);if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago'}
+async function refresh(){
+  try{
+    const[st,ml]=await Promise.all([fetch(BASE+'/status').then(r=>r.json()),fetch(BASE+'/models?detail=true').then(r=>r.json())]);
+    document.getElementById('v-status').textContent=st.status==='ok'?'Healthy':'Degraded';
+    document.getElementById('c-status').className='card '+(st.status==='ok'?'ok':'warn');
+    document.getElementById('v-uptime').textContent='Uptime: '+st.uptime;
+    document.getElementById('v-models').textContent=st.model_count>=0?st.model_count:'?';
+    document.getElementById('v-registry').textContent=st.registry;
+    document.getElementById('v-uploads').textContent=st.stats.uploads;
+    document.getElementById('v-last-upload').textContent='Last: '+ago(st.stats.last_upload);
+    document.getElementById('v-downloads').textContent=st.stats.downloads;
+    document.getElementById('v-last-download').textContent='Last: '+ago(st.stats.last_download);
+    const rows=ml.models.map(m=>`<tr><td><strong>${m.name}</strong></td><td>v${m.latest_version}</td>`
+      +`<td>${m.task||'—'}</td><td>${m.device||'—'}</td><td>${m.model_type||'—'}</td>`
+      +`<td>${fmt(m.size_bytes)}</td>`
+      +`<td>${m.fl_ready?'<span class="badge badge-green">✓ Ready</span>':'<span class="badge badge-gray">—</span>'}</td></tr>`).join('');
+    document.getElementById('model-rows').innerHTML=rows||'<tr><td colspan="7" style="text-align:center;color:#52525b">No models</td></tr>';
+    document.getElementById('last-refresh').textContent=new Date().toLocaleTimeString();
+    document.getElementById('error').style.display='none';
+  }catch(e){document.getElementById('error').textContent='Failed to load: '+e;document.getElementById('error').style.display='block'}
+}
+refresh();setInterval(refresh,30000);
+</script></body></html>"""

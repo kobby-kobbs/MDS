@@ -3,6 +3,8 @@ MDS SDK Client -- Interactive & CLI modes.
 Interactive (demo): python mds_cli.py        CLI: python mds_cli.py list|download|upload|...
 Env: MDS_BASE_URL, MDS_TOKEN, MDS_PRIVATE_KEY_PATH
 """
+__version__ = "0.5.0"
+
 import argparse, io, json, os, sys, time, zipfile
 from pathlib import Path, PurePosixPath
 import requests
@@ -379,10 +381,8 @@ def _do_staged_upload_sdk(model_name, source, task=None, device=None, descriptio
 # -- CLI commands -----------------------------------------------------------------
 
 def cmd_list(_):
-    r = requests.get(f"{BASE_URL}/models", timeout=30); r.raise_for_status(); data = r.json()
-    models = data.get("models", [])
-    print(f"\nRegistry: {data.get('registry','?')}  ({len(models)} models)")
-    for m in models: print(f"  {m['name']:<40} v{m['latest_version']}")
+    models, reg = _fetch_models(detail=True)
+    _show_models(models, reg)
 
 def cmd_sync(_):
     r = requests.get(f"{BASE_URL}/models/sync", headers=_headers(), timeout=60)
@@ -402,6 +402,52 @@ def cmd_info(args):
     params = {"version": args.version} if args.version else {}
     r = requests.get(f"{BASE_URL}/models/{args.model_name}", params=params, headers=_headers(), timeout=30)
     r.raise_for_status(); print(json.dumps(r.json(), indent=2))
+
+def cmd_delete(args):
+    """Delete a model from registry and blob storage."""
+    name = args.model_name
+    ver = getattr(args, "version", None)
+    skip = getattr(args, "yes", False)
+    label = f"{name} v{ver}" if ver else f"{name} (all versions)"
+    if not skip:
+        confirm = input(f"  Delete '{label}'? This cannot be undone. [y/N]: ").strip().lower()
+        if confirm != "y":
+            print("  Cancelled."); return
+    print(f"  Deleting {label}...")
+    params = {"version": ver} if ver else {}
+    r = requests.delete(f"{BASE_URL}/models/{name}", params=params, headers=_headers(), timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    deleted = data.get("versions_deleted", [])
+    print(f"  ✓ Deleted {len(deleted)} version(s): {', '.join(f'v{v}' for v in deleted)}")
+    warnings = data.get("blob_warnings", [])
+    if warnings:
+        for w in warnings:
+            print(f"  [WARN] Blob cleanup: {w}")
+
+def cmd_status(_):
+    """Show service status."""
+    r = requests.get(f"{BASE_URL}/status", timeout=15)
+    r.raise_for_status(); data = r.json()
+    print(f"\n  {'─'*50}")
+    print(f"  MDS Service Status")
+    print(f"  {'─'*50}")
+    print(f"  Status:      {data['status'].upper()}")
+    print(f"  Uptime:      {data['uptime']}")
+    print(f"  Started:     {data['started_at'][:19]}")
+    print(f"  Registry:    {data['registry']}")
+    print(f"  Storage:     {data['storage']}")
+    print(f"  Models:      {data['model_count']}")
+    print(f"  Uploads:     {data['stats']['uploads']}  (last: {data['stats']['last_upload'] or 'never'})")
+    print(f"  Downloads:   {data['stats']['downloads']}  (last: {data['stats']['last_download'] or 'never'})")
+    print(f"  {'─'*50}")
+
+def cmd_dashboard(_):
+    """Open the live dashboard in the default browser."""
+    import webbrowser
+    url = f"{BASE_URL}/dashboard"
+    print(f"  Opening dashboard: {url}")
+    webbrowser.open(url)
 
 def cmd_catalog(args):
     r = requests.post(f"{BASE_URL}/catalog", json={"indexEntitiesRequest": {"pageSize": args.page_size or 50}},
@@ -429,7 +475,7 @@ def cmd_catalog_fl(args):
     r.raise_for_status()
     resp = r.json().get("indexEntitiesResponse", {})
     models = resp.get("value", [])
-    print(f"\nMDS Private Models  ({len(models)} found)")
+    print(f"\nPrivate Models  ({len(models)} found)")
     print(f"  {'NAME':<40} {'VER':>4}  {'DEVICE':<5}  {'EP':<28}  {'SIZE':>8}  URI")
     print(f"  {'-'*40} {'-'*4}  {'-'*5}  {'-'*28}  {'-'*8}  {'-'*50}")
     for m in models:
@@ -847,22 +893,44 @@ def _pick(title, options, allow_back=False):
         lo = 0 if allow_back else 1
         print(f"  Enter {lo}-{len(options)}")
 
-def _fetch_models():
+def _fetch_models(detail=False):
     try:
-        r = requests.get(f"{BASE_URL}/models", timeout=15); r.raise_for_status()
+        params = {"detail": "true"} if detail else {}
+        r = requests.get(f"{BASE_URL}/models", params=params, timeout=15); r.raise_for_status()
         data = r.json(); return data.get("models", []), data.get("registry", "?")
     except Exception as e:
         print(f"  [WARN] {e}"); return [], "?"
 
 def _show_models(models, reg):
     print(f"\n  Registry: {reg}  ({len(models)} models)")
-    for i, m in enumerate(models, 1): print(f"    [{i}] {m['name']:<40} v{m['latest_version']}")
+    if not models:
+        print("    (no models)")
+        return
+    # Check if we have detail fields
+    has_detail = any(m.get("task") for m in models)
+    if has_detail:
+        hdr = f"    {'#':>3}  {'NAME':<32} {'VER':>4}  {'TASK':<18} {'DEVICE':<6} {'SIZE':>9}  {'FL':>3}"
+        sep = f"    {'─'*3}  {'─'*32} {'─'*4}  {'─'*18} {'─'*6} {'─'*9}  {'─'*3}"
+        print(hdr)
+        print(sep)
+        for i, m in enumerate(models, 1):
+            name = m['name'][:32]
+            ver = f"v{m['latest_version']}"
+            task = (m.get('task') or '—')[:18]
+            device = (m.get('device') or '—')[:6]
+            sb = m.get('size_bytes', 0)
+            size = _human(sb) if sb else '—'
+            fl = '✓' if m.get('fl_ready') else '—'
+            print(f"    {i:>3}  {name:<32} {ver:>4}  {task:<18} {device:<6} {size:>9}  {fl:>3}")
+    else:
+        for i, m in enumerate(models, 1):
+            print(f"    [{i}] {m['name']:<40} v{m['latest_version']}")
 
 # -- Interactive mode -------------------------------------------------------------
 
 def _interactive():
     global _TOKEN
-    print("\n" + "=" * 60 + "\n  MDS -- Model Distribution Service\n" + "=" * 60)
+    print("\n" + "=" * 60 + f"\n  MDS -- Model Distribution Service  v{__version__}\n" + "=" * 60)
     print(f"\n  Server: {BASE_URL}")
     if input("  Change URL? [y/N]: ").strip().lower() == "y":
         url = input("  URL: ").strip()
@@ -915,26 +983,29 @@ def _interactive():
 
     # Step 2: Entitlement
     print(f"\n{'- '*30}\n  Step 2: Entitlement\n{'- '*30}")
-    models, reg = _fetch_models()
+    models, reg = _fetch_models(detail=True)
     _show_models(models, reg)
 
     # Step 3: Action loop
     while True:
         print(f"\n{'- '*30}\n  Step 3: Choose action\n{'- '*30}")
         idx, _ = _pick("Action", [
-            "List models       (choose source: MDS or Foundry Local)",
-            "Download a model  (choose source: MDS or Foundry Local)",
-            "Run a model       (interactive chat with Foundry Local)",
-            "Upload a model    (MDS blob storage)",
-            "Model cache       (show cached/loaded FL models)",
-            "View model details (MDS)",
-            "Sync report       (MDS registry vs blob)",
+            "List models       (Private or Public catalog)",
+            "Download a model  (Private or Public catalog)",
+            "Run a model       (interactive chat)",
+            "Upload a model    (Private Azure Storage)",
+            "Delete a model    (remove from registry + storage)",
+            "Model cache       (show cached/loaded models)",
+            "View model details",
+            "Service status    (health, uptime, stats)",
+            "Sync report       (registry vs blob)",
             "Exit",
         ])
         try:
-            if idx == 8: print("\n  Goodbye!"); break
-            elif idx == 7: cmd_sync(None)
-            elif idx == 6:
+            if idx == 10: print("\n  Goodbye!"); break
+            elif idx == 9: cmd_sync(None)
+            elif idx == 8: cmd_status(None)
+            elif idx == 7:
                 if models:
                     idx_d, name = _pick("Model", [m["name"] for m in models], allow_back=True)
                     if idx_d == 0: continue
@@ -942,12 +1013,20 @@ def _interactive():
                     name = input("  Model name: ").strip()
                     if not name: continue
                 cmd_info(argparse.Namespace(model_name=name, version=None))
-            elif idx == 5: cmd_cache(argparse.Namespace())
+            elif idx == 6: cmd_cache(argparse.Namespace())
+            elif idx == 5:
+                if not models: models, reg = _fetch_models(detail=True)
+                if not models:
+                    print("  No models to delete."); continue
+                idx_d, name = _pick("Delete which model?", [m["name"] for m in models], allow_back=True)
+                if idx_d == 0: continue
+                cmd_delete(argparse.Namespace(model_name=name, version=None, yes=False))
+                models, reg = _fetch_models(detail=True)  # refresh
             elif idx == 4: _interactive_upload()
             elif idx == 3:
                 src, _ = _pick("Run from which source?", [
-                    "MDS Private Models  (downloaded to local folder)",
-                    "Foundry Local       (cached models, FL service)",
+                    "Private Models  (downloaded to local folder)",
+                    "Public Models   (cached models from public catalog)",
                 ], allow_back=True)
                 if src == 0: continue
                 elif src == 1:
@@ -956,22 +1035,22 @@ def _interactive():
                     _interactive_run()
             elif idx == 1:  # List
                 src, _ = _pick("List from which source?", [
-                    "MDS Private Models  (your blob storage, requires JWT)",
-                    "Foundry Local       (public Microsoft catalog, 107+ models)",
+                    "Private Models ",
+                    "Public Models ",
                 ], allow_back=True)
                 if src == 0: continue
                 elif src == 1:
-                    models, reg = _fetch_models(); _show_models(models, reg)
+                    models, reg = _fetch_models(detail=True); _show_models(models, reg)
                 else:
                     cmd_list_fl(None)
             elif idx == 2:  # Download
                 src, _ = _pick("Download from which source?", [
-                    "MDS Private Models  (your blob storage, requires JWT)",
-                    "Foundry Local       (public Microsoft catalog, uses foundry CLI)",
+                    "Private Models ",
+                    "Public Models ",
                 ], allow_back=True)
                 if src == 0: continue
                 elif src == 1:
-                    if not models: models, reg = _fetch_models(); _show_models(models, reg)
+                    if not models: models, reg = _fetch_models(detail=True); _show_models(models, reg)
                     _interactive_download(models)
                 else:
                     _interactive_download_fl()
@@ -1391,8 +1470,8 @@ def _offer_run_after(model_name, local_path=None):
         return
     if run_now == "n": return
     src, _ = _pick("Run from which source?", [
-        "MDS Private Models  (use local downloaded folder)",
-        "Foundry Local       (cached models, FL service)",
+        "Private Models  (use local downloaded folder)",
+        "Public Models   (cached models from public catalog)",
     ], allow_back=True)
     if src == 0: return
     if src == 1:
@@ -1483,6 +1562,7 @@ def _set_fl_url(url):
 def main():
     p = argparse.ArgumentParser(prog="mds", description="MDS SDK Client",
                                 epilog="Run without arguments for interactive demo mode.")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("--base-url", default=BASE_URL, help="MDS server URL")
     p.add_argument("--fl-url", default=FL_URL, help="Foundry Local service URL")
     sub = p.add_subparsers(dest="command")
@@ -1526,6 +1606,14 @@ def main():
     sp.add_argument("--task", default=None); sp.add_argument("--device", default=None); sp.add_argument("--description", default=None)
     sp.add_argument("--no-wait", action="store_true")
     sp.add_argument("--method", choices=["azcopy", "sdk"], default="azcopy", help="Upload method: azcopy (default) or sdk")
+    # Delete command
+    delp = sub.add_parser("delete", help="Delete a model from registry and storage")
+    delp.add_argument("model_name", help="Model name to delete")
+    delp.add_argument("--version", "-v", default=None, help="Delete specific version (default: all versions)")
+    delp.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
+    # Status/dashboard command
+    sub.add_parser("status", help="Show service status")
+    sub.add_parser("dashboard", help="Open live dashboard in browser")
     args = p.parse_args()
     if args.base_url != BASE_URL: _set_base_url(args.base_url)
     if args.fl_url != FL_URL: _set_fl_url(args.fl_url)
@@ -1534,7 +1622,8 @@ def main():
             "catalog-fl": cmd_catalog_fl, "list-fl": cmd_list_fl, "download-fl": cmd_download_fl,
             "download": cmd_download, "upload": cmd_upload, "upload-staged": cmd_upload_staged,
             "run": cmd_run, "chat": cmd_chat, "cache": cmd_cache,
-            "load": cmd_load, "unload": cmd_unload}
+            "load": cmd_load, "unload": cmd_unload,
+            "delete": cmd_delete, "status": cmd_status, "dashboard": cmd_dashboard}
     try: cmds[args.command](args)
     except requests.HTTPError as e: print(f"\n[ERROR] HTTP {e.response.status_code}: {e.response.text[:300]}"); sys.exit(1)
     except KeyboardInterrupt: print("\nCancelled."); sys.exit(130)

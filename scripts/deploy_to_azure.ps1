@@ -12,7 +12,10 @@ $APP_SERVICE_PLAN     = "mds-app-plan"
 $WEB_APP_NAME         = "mds-model-distribution"
 $REGISTRY_NAME        = "customer-phone"
 $STORAGE_ACCOUNT      = "customermodelstorage"
-$PHONEPE_API_KEY      = "ZLLuYBudNgeUQCHUTmqt_W_M1TSJC-KVozKMh9Ozr-Q"
+$PHONEPE_API_KEY      = $env:PHONEPE_API_KEY
+if (-not $PHONEPE_API_KEY) {
+    $PHONEPE_API_KEY = Read-Host "Enter PhonePe API key (or set PHONEPE_API_KEY env var)"
+}
 
 # ============================================================
 # STEP 1: Check Azure login

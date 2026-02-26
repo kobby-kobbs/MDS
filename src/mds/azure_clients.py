@@ -170,3 +170,17 @@ def download_blob(blob_name: str, *, storage_account: str | None = None) -> byte
     acct = storage_account or STORAGE_ACCOUNT
     container = get_blob_client(acct).get_container_client(STORAGE_CONTAINER)
     return container.get_blob_client(blob_name).download_blob().readall()
+
+
+def delete_blobs(blob_names: list[str], *, storage_account: str | None = None) -> int:
+    """Delete a list of blobs from storage. Returns count of successfully deleted blobs."""
+    acct = storage_account or STORAGE_ACCOUNT
+    container = get_blob_client(acct).get_container_client(STORAGE_CONTAINER)
+    deleted = 0
+    for name in blob_names:
+        try:
+            container.get_blob_client(name).delete_blob()
+            deleted += 1
+        except Exception as e:
+            log.warning(f"Failed to delete blob {name}: {e}")
+    return deleted
