@@ -1,14 +1,19 @@
 """Unit tests for azure_clients — all Azure SDK calls mocked."""
 
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import patch, MagicMock
 
 from mds.azure_clients import (
-    get_ml_client, get_blob_client,
-    upload_to_blob, generate_sas_url, generate_upload_sas_url,
-    list_blobs, download_blob,
-    _ml_clients, _blob_clients,
-    REGISTRY_NAME, STORAGE_ACCOUNT, STORAGE_CONTAINER,
+    REGISTRY_NAME,
+    STORAGE_ACCOUNT,
+    _blob_clients,
+    _ml_clients,
+    download_blob,
+    generate_sas_url,
+    get_blob_client,
+    get_ml_client,
+    list_blobs,
 )
 
 
@@ -65,19 +70,6 @@ class TestGetBlobClient:
         assert a is b
 
 
-class TestUploadToBlob:
-    @patch("mds.azure_clients.get_blob_client")
-    def test_returns_url(self, gc):
-        url = upload_to_blob(b"data", "m/v1/f.onnx")
-        assert STORAGE_ACCOUNT in url and "f.onnx" in url
-
-    @patch("mds.azure_clients.get_blob_client")
-    def test_container_already_exists(self, gc):
-        gc.return_value.get_container_client.return_value.create_container.side_effect = Exception
-        url = upload_to_blob(b"x", "blob")
-        assert isinstance(url, str)
-
-
 class TestGenerateSasUrl:
     @patch("mds.azure_clients.generate_blob_sas", return_value="sig=1")
     @patch("mds.azure_clients.get_blob_client")
@@ -91,16 +83,6 @@ class TestGenerateSasUrl:
     def test_custom_storage(self, gc, gen):
         gc.return_value.get_user_delegation_key.return_value = MagicMock()
         assert "acme" in generate_sas_url("f", storage_account="acme")
-
-
-class TestGenerateUploadSasUrl:
-    @patch("mds.azure_clients.generate_container_sas", return_value="sig=u")
-    @patch("mds.azure_clients.get_blob_client")
-    def test_returns_url(self, gc, gen):
-        gc.return_value.get_user_delegation_key.return_value = MagicMock()
-        url = generate_upload_sas_url("prefix/v1")
-        assert "sig=u" in url
-        assert "prefix/v1" in url
 
 
 class TestListBlobs:

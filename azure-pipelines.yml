@@ -1,0 +1,64 @@
+# ============================================================
+# Azure DevOps Pipeline — Lint, Test, Coverage
+# ============================================================
+trigger:
+  branches:
+    include:
+      - main
+      - dev
+      - FLint
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: "ubuntu-latest"
+
+strategy:
+  matrix:
+    Python311:
+      python.version: "3.11"
+    Python312:
+      python.version: "3.12"
+
+steps:
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: "$(python.version)"
+    displayName: "Use Python $(python.version)"
+
+  - script: |
+      pip install -r requirements.txt
+      pip install -e ".[dev]"
+    displayName: "Install dependencies"
+
+  - script: ruff check src/ tests/
+    displayName: "Lint (ruff check)"
+
+  - script: ruff format --check src/ tests/
+    displayName: "Lint (ruff format)"
+
+  - script: |
+      pytest tests/unit \
+        --tb=short \
+        --junitxml=$(Build.ArtifactStagingDirectory)/test-results.xml \
+        --cov=mds \
+        --cov-report=xml:$(Build.ArtifactStagingDirectory)/coverage.xml \
+        --cov-report=term-missing \
+        -q
+    displayName: "Run unit tests"
+
+  - task: PublishTestResults@2
+    condition: always()
+    inputs:
+      testResultsFormat: "JUnit"
+      testResultsFiles: "$(Build.ArtifactStagingDirectory)/test-results.xml"
+    displayName: "Publish test results"
+
+  - task: PublishCodeCoverageResults@2
+    condition: always()
+    inputs:
+      summaryFileLocation: "$(Build.ArtifactStagingDirectory)/coverage.xml"
+    displayName: "Publish code coverage"

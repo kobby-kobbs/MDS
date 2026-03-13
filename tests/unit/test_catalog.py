@@ -1,14 +1,8 @@
 """Unit tests for catalog module."""
 
-import pytest
+from conftest import FakeModel
+
 from mds.catalog import CatalogRequest, IndexEntitiesRequest, build_foundry_model
-
-
-class _FakeModelInfo:
-    """Minimal stand-in for Azure ML Model objects."""
-    def __init__(self, name="test-model", version="1"):
-        self.name = name
-        self.version = version
 
 
 class TestCatalogRequest:
@@ -25,7 +19,7 @@ class TestCatalogRequest:
 
 class TestBuildFoundryModel:
     def test_basic_fields(self):
-        info = _FakeModelInfo(name="mnist", version="3")
+        info = FakeModel(name="mnist", version="3")
         result = build_foundry_model(info, {})
 
         assert result["assetId"] == "mnist-v3"
@@ -44,7 +38,7 @@ class TestBuildFoundryModel:
             "executionProvider": "cudaexecutionprovider",
             "modelType": "pytorch",
             "file_size_bytes": "12345",
-            "uploaded_by": "phonepe",
+            "author": "phonepe",
             "license": "MIT",
             "licenseDescription": "Open source",
             "promptTemplate": "<|user|>{prompt}",
@@ -54,7 +48,7 @@ class TestBuildFoundryModel:
             "toolCallStart": "<tool_call>",
             "toolCallEnd": "</tool_call>",
         }
-        result = build_foundry_model(_FakeModelInfo(), tags)
+        result = build_foundry_model(FakeModel(), tags)
         ann_tags = result["annotations"]["tags"]
 
         assert ann_tags["alias"] == "my-alias"
@@ -79,7 +73,7 @@ class TestBuildFoundryModel:
     def test_optional_tags_omitted_when_empty(self):
         """Optional tags (tool calling, maxOutputTokens) should NOT appear when not set.
         Core FL tags (foundryLocal, disable-maap) are always present."""
-        result = build_foundry_model(_FakeModelInfo(), {})
+        result = build_foundry_model(FakeModel(), {})
         ann_tags = result["annotations"]["tags"]
         # Core FL tags are always present
         assert ann_tags["foundryLocal"] == "true"
@@ -90,7 +84,7 @@ class TestBuildFoundryModel:
         assert "toolCallStart" not in ann_tags
 
     def test_defaults_when_tags_empty(self):
-        result = build_foundry_model(_FakeModelInfo(name="m"), {})
+        result = build_foundry_model(FakeModel(name="m"), {})
         ann_tags = result["annotations"]["tags"]
 
         assert ann_tags["alias"] == "m"
@@ -105,19 +99,19 @@ class TestBuildFoundryModel:
         assert variant["fileSizeBytes"] == 0
 
     def test_non_numeric_version(self):
-        info = _FakeModelInfo(version="beta")
+        info = FakeModel(version="beta")
         result = build_foundry_model(info, {})
         assert result["properties"]["version"] == 1
         assert result["properties"]["alphanumericVersion"] == "beta"
 
     def test_uri_default_registry(self):
         """Without registry_name, Uri uses 'azureml' as default."""
-        info = _FakeModelInfo(name="mnist", version="3")
+        info = FakeModel(name="mnist", version="3")
         result = build_foundry_model(info, {})
         assert result["properties"]["uri"] == "azureml://registries/azureml/models/mnist/versions/3"
 
     def test_uri_custom_registry(self):
         """With registry_name, Uri uses the customer's registry."""
-        info = _FakeModelInfo(name="qwen", version="2")
+        info = FakeModel(name="qwen", version="2")
         result = build_foundry_model(info, {}, registry_name="customer-phone")
         assert result["properties"]["uri"] == "azureml://registries/customer-phone/models/qwen/versions/2"

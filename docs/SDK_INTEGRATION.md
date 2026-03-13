@@ -8,7 +8,6 @@
 │                                                                 │
 │  POST /catalog  — returns indexEntitiesResponse JSON            │
 │  POST /download — validates JWT, returns SAS URL                │
-│  POST /upload   — accepts model + FL metadata                   │
 │  GET  /models/* — model detail in FL format                     │
 │  JWKS validation — verifies customer tokens                     │
 │                                                                 │
@@ -144,7 +143,6 @@ Microsoft staging).
 | List catalog models | `POST /catalog`       | ✅     | SDK internally (via `AzureCatalogUri`) |
 | Get model info      | `GET /models/{name}`  | ✅     | SDK or customer app |
 | Download model      | `POST /download`      | ✅     | SDK internally (`model.download()`) |
-| Upload model        | `POST /upload`        | ✅     | Customer's CI/CD or admin script |
 | Health check        | `GET /health`         | ✅     | Monitoring / health probes |
 
 ### What MDS Does NOT Do

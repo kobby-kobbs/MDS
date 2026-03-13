@@ -19,12 +19,14 @@ dependencies = [
     "azure-identity",
     "requests",
     "cachetools",
+    "slowapi",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
     "pytest-asyncio",
+    "pytest-cov",
     "httpx",
     "ruff",
 ]
@@ -34,7 +36,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "tests"]
 markers = [
     "integration: end-to-end tests requiring a running server",
 ]

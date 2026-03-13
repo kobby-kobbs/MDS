@@ -12,6 +12,13 @@ MDS is a private model distribution service that:
 3. Serves a **Foundry Local SDK–compatible catalog** so your on-device inference stack can discover and download models
 4. Authenticates every request with **JWT / RS256** tokens issued by _your_ auth system
 
+### Authentication Modes
+
+| Mode | Registration | Best For |
+|------|-------------|----------|
+| **Self-service JWT** (recommended) | None — token carries all claims | New customers, any IdP |
+| **API key** (legacy) | Required via `/admin/register` | Backward compat with FL Core |
+
 ```
 ┌──────────────┐     JWT     ┌─────────┐     Azure ML     ┌──────────────┐
 │  Your Auth   │────────────▶│   MDS   │────────────────▶  │  ML Registry │
@@ -77,11 +84,23 @@ Every API call to MDS requires a valid JWT in the `Authorization: Bearer <token>
 
 | Claim | Value | Example |
 |-------|-------|---------|
-| `iss` | `https://auth.<customer_id>.com` | `https://auth.phonepe.com` |
-| `sub` | Your subject identifier | `phonepe-india` |
+| `iss` | Your IdP's issuer URL | `https://dev-xxx.us.auth0.com/` |
+| `sub` | Your subject identifier | `my-app@clients` |
 | `aud` | `model-distribution-service` | (fixed value) |
 | `iat` | Issued-at timestamp | `1719849600` |
-| `exp` | Expiry timestamp (max 1 hour recommended) | `1719853200` |
+| `exp` | Expiry timestamp (max 24 hours recommended) | `1719853200` |
+
+### Self-Service Claims (Recommended)
+
+These claims enable the **self-service flow** — no MDS pre-registration needed:
+
+| Claim | Value | Example |
+|-------|-------|---------|
+| `registry_name` | Your Azure ML Registry name | `customer-phone` |
+| `storage_account` | Your Azure Storage account name | `customermodelstorage` |
+| `entitlements` | Model access rules (object) | `{"models":["*"],"versions":["*"]}` |
+
+> **Note:** Auth0 requires a URL namespace for object claims. Use `https://mds.microsoft.com/entitlements` as the claim name. If `entitlements` is omitted, MDS defaults to wildcard access.
 
 ### Required JWT Header
 
@@ -90,121 +109,82 @@ Every API call to MDS requires a valid JWT in the `Authorization: Bearer <token>
 | `alg` | `RS256` |
 | `kid` | Key ID matching a key in your JWKS endpoint |
 
-### Example Token Generation (Python)
+### IdP-Specific Configuration
 
-```python
-import jwt
-from datetime import datetime, timedelta, timezone
-
-token = jwt.encode(
-    {
-        "sub": "phonepe-india",
-        "iss": "https://auth.phonepe.com",
-        "aud": "model-distribution-service",
-        "iat": datetime.now(timezone.utc),
-        "exp": datetime.now(timezone.utc) + timedelta(hours=1),
-    },
-    private_key_pem,
-    algorithm="RS256",
-    headers={"kid": "prod-key-2025-01"},
-)
+#### Auth0
+1. Create a **Machine-to-Machine** application
+2. Authorize it against API `model-distribution-service`
+3. Create an **Action** with trigger `Machine to Machine / Credentials Exchange`:
+```js
+exports.onExecuteCredentialsExchange = async (event, api) => {
+  api.accessToken.setCustomClaim('registry_name', '<your-registry>');
+  api.accessToken.setCustomClaim('storage_account', '<your-storage>');
+  api.accessToken.setCustomClaim('https://mds.microsoft.com/entitlements', {
+    models: ['*'], versions: ['*']
+  });
+};
 ```
+4. Deploy and wire the action into the **Machine to Machine** flow
+5. Token endpoint: `https://<domain>/oauth/token`
+
+#### Okta
+1. Create an OAuth2 **service application**
+2. Add custom claims to your authorization server
+3. Token endpoint: `https://<domain>/oauth2/default/v1/token`
+
+#### Azure AD / Entra ID
+1. Register an application and create a client secret
+2. Configure custom claims via claims-mapping policy
+3. Token endpoint: `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token`
 
 ---
 
-## Step 3 — Register with MDS
+## Step 3 — Provision Azure Resources
 
-Contact the MDS team to register your organization. You will provide:
+Run the onboarding script to create storage and ML registry:
 
-| Information | Purpose |
-|-------------|---------|
-| **Customer ID** | Short identifier (e.g. `phonepe`) — used to match JWT issuers |
-| **JWKS URL** | Your JWKS endpoint for key verification |
-| **Model entitlements** | Which models you can access (`*` = all, or specific names) |
-| **Contact email** | For incident notifications |
-
-The MDS team will add your configuration to the server:
-
-```python
-# Added to customers.py
-CUSTOMERS["phonepe"] = {
-    "name": "PhonePe India",
-    "sub": "phonepe-india",
-    "models": ["*"],
-    "jwks_url": "https://auth.phonepe.com/.well-known/jwks.json",
-}
+### Self-service JWT (recommended)
+```powershell
+.\infrastructure\onboard.ps1 -Customer acme `
+  -Issuer "https://acme.us.auth0.com/" `
+  -SelfServiceJwt `
+  -TokenEndpoint "https://acme.us.auth0.com/oauth/token" `
+  -ClientId "your-client-id"
 ```
+
+This creates Azure resources and outputs your FL Core config — no MDS registration needed.
+
+### API key mode (legacy)
+```powershell
+.\infrastructure\onboard.ps1 -Customer acme `
+  -Issuer "https://auth.acme.com" `
+  -MdsUrl "https://mds-model-distribution.azurewebsites.net" `
+  -AdminKey "<admin-key>"
+```
+
+The MDS team will provide the admin key. An API key is generated and shown once.
 
 ---
 
-## Step 4 — Upload Models
+## Step 4 — Register Models in Azure ML Registry
 
-### Option A: Single-File Upload (< 500 MB)
-
-```bash
-curl -X POST https://mds-model-distribution.azurewebsites.net/upload \
-  -H "Authorization: Bearer $TOKEN" \
-  -F "model_name=my-model" \
-  -F "description=My custom ONNX model" \
-  -F "task=text-generation" \
-  -F "input_modalities=text" \
-  -F "output_modalities=text" \
-  -F "device=cpu" \
-  -F "model_type=onnx" \
-  -F "file=@my-model.onnx"
-```
-
-**Auto-metadata**: MDS automatically extracts metadata from uploaded files:
-- `.onnx` files → model type, task hints, modality hints from operators
-- `.zip` / `.tar.gz` archives → parses `config.json`, `tokenizer_config.json`, `README.md`
-  for model architecture, tokenizer info, license, and task inference
-
-### Option B: Staged Upload for Large Models (> 500 MB / Multi-File)
-
-For large models or model directories with multiple files, use the **two-phase upload**:
+Models are registered directly in the Azure ML Registry using the Azure CLI or SDK. Contact the MDS team for access to your dedicated registry.
 
 ```bash
-# 1. Begin staging — get a SAS upload URL (valid for 4 hours)
-curl -X POST https://mds-model-distribution.azurewebsites.net/upload/begin \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"model_name": "large-model", "task": "chat-completion", "device": "npu"}'
-
-# Response:
-# {
-#   "session_id": "abc123...",
-#   "upload_url": "https://customermodelstorage.blob.core.windows.net/models/large-model/v1?sv=...",
-#   "blob_prefix": "large-model/v1",
-#   "expires_in": "4 hours"
-# }
-
-# 2. Upload files with azcopy
-azcopy copy ./model_directory "$UPLOAD_URL" --recursive
-
-# 3. Complete staging — register the model
-curl -X POST https://mds-model-distribution.azurewebsites.net/upload/complete \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"session_id": "abc123..."}'
+# Register a model using the Azure CLI
+az ml model create \
+  --name my-model \
+  --version 1 \
+  --path ./model-files/ \
+  --registry-name <your-registry> \
+  --tags foundryLocal=true task=chat-completion device=cpu modelType=onnx
 ```
 
-### Upload Form Fields Reference
-
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `model_name` | ✅ | — | Unique model identifier |
-| `description` | | `""` | Human-readable description |
-| `alias` | | model_name | Display alias |
-| `task` | | `"custom"` | `text-generation`, `chat-completion`, `classification`, etc. |
-| `input_modalities` | | `"text"` | `text`, `image`, `audio` |
-| `output_modalities` | | `"text"` | `text`, `image`, `audio` |
-| `device` | | `"cpu"` | `cpu`, `gpu`, `npu` |
-| `execution_provider` | | `"cpuexecutionprovider"` | ONNX runtime EP |
-| `model_type` | | `"onnx"` | `onnx`, `pytorch`, etc. |
-| `prompt_template` | | `""` | Chat template (Jinja2) |
-| `license_id` | | `""` | SPDX license ID |
-| `max_output_tokens` | | `""` | Max output token count |
-| `supports_tool_calling` | | `""` | `"true"` if model supports tools |
+Required tags for Foundry Local compatibility:
+- `foundryLocal`: Set to `"true"` to include in FL catalog
+- `task`: e.g. `chat-completion`, `text-generation`, `classification`
+- `device`: e.g. `cpu`, `gpu`, `npu`
+- `modelType`: e.g. `onnx`
 
 ---
 
@@ -292,7 +272,7 @@ Use these curl commands to verify your setup:
 ### 1. Health Check (no auth required)
 ```bash
 curl https://mds-model-distribution.azurewebsites.net/health
-# {"status": "ok", "registry": "customer-phone", "storage": "customermodelstorage"}
+# {"status": "ok"}
 ```
 
 ### 2. List Models

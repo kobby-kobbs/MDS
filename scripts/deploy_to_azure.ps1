@@ -16,6 +16,10 @@ $PHONEPE_API_KEY      = $env:PHONEPE_API_KEY
 if (-not $PHONEPE_API_KEY) {
     $PHONEPE_API_KEY = Read-Host "Enter PhonePe API key (or set PHONEPE_API_KEY env var)"
 }
+$MDS_ADMIN_KEY        = $env:MDS_ADMIN_KEY
+if (-not $MDS_ADMIN_KEY) {
+    $MDS_ADMIN_KEY = Read-Host "Enter MDS Admin key (or set MDS_ADMIN_KEY env var)"
+}
 
 # ============================================================
 # STEP 1: Check Azure login
@@ -81,7 +85,8 @@ az webapp config appsettings set `
         WEBSITES_PORT=8000 `
         WEBSITES_CONTAINER_START_TIME_LIMIT=600 `
         CUSTOMER_PHONEPE_JWKS_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/jwks/jwks.json" `
-        CUSTOMER_PHONEPE_API_KEY=$PHONEPE_API_KEY
+        CUSTOMER_PHONEPE_API_KEY=$PHONEPE_API_KEY `
+        MDS_ADMIN_KEY=$MDS_ADMIN_KEY
 
 Write-Host "Environment variables configured" -ForegroundColor Green
 
@@ -175,7 +180,6 @@ if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 #   src/mds/catalog.py
 #   src/mds/customers.py
 #   src/mds/jwks.py
-#   src/mds/metadata.py
 
 Write-Host "Creating deployment package (Python zipfile)..." -ForegroundColor Yellow
 

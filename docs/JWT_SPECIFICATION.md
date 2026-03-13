@@ -24,7 +24,7 @@ Customers authenticate to MDS using **RS256-signed JWT tokens**. Each customer r
 |-------|------|-------------|---------|
 | `jti` | string | **JWT ID** - Unique identifier for the token (for replay protection) | `abc123-def456` |
 | `nbf` | number | **Not Before** - Token not valid before this time | `1738796400` |
-| `scope` | string | **Scope** - Space-separated permissions | `models:read models:write` |
+| `scope` | string | **Scope** - Space-separated permissions | `models:read` |
 | `device_id` | string | **Device ID** - For mobile SDK, identifies the device | `pixel7-abc123` |
 | `app_version` | string | **App Version** - Customer's app version | `2.5.1` |
 
@@ -62,20 +62,48 @@ RS256 signature using customer's private key.
 
 ## Issuer URL Convention
 
-Each customer has a unique issuer URL following this pattern:
+MDS derives the JWKS URL automatically from the token's `iss` claim:
 
 ```
-https://auth.{customer_id}.com
+JWKS URL = {iss}/.well-known/jwks.json
 ```
 
-Examples:
-- PhonePe: `https://auth.phonepe.com`
-- Contoso: `https://auth.contoso.com`
-- Acme: `https://auth.acme.com`
+Any publicly-reachable OIDC-compliant issuer works — Auth0, Okta, Entra ID, or custom. No customer pre-registration needed.
 
-MDS extracts the `customer_id` from the issuer URL to look up:
-1. Customer's public key
-2. Customer's entitlements (which models they can access)
+---
+
+## Self-Service Claims
+
+These custom claims enable the **self-service JWT flow** where no pre-registration with MDS is needed. When present, MDS uses these claims directly instead of looking up customer config.
+
+| Claim | Type | Required | Description | Example |
+|-------|------|----------|-------------|---------|
+| `registry_name` | string | Yes | Azure ML Registry name | `customer-phone` |
+| `storage_account` | string | Yes | Azure Blob Storage account | `customermodelstorage` |
+| `entitlements` | object | No | Model/version access rules | `{"models":["*"],"versions":["*"]}` |
+
+**Entitlements format:**
+```json
+{
+  "models": ["model-a", "model-b"],  // or ["*"] for all
+  "versions": ["1", "2"]             // or ["*"] for all
+}
+```
+
+**Notes:**
+- If `entitlements` is omitted, defaults to wildcard access (all models, all versions)
+- Auth0 requires a URL namespace for object claims: use `https://mds.microsoft.com/entitlements` as the claim name
+- MDS accepts `entitlements` as a JSON object, JSON-encoded string, or the namespaced key
+
+---
+
+## Issuer Examples
+- Auth0: `https://dev-xxx.us.auth0.com/`
+- Okta: `https://acme.okta.com/oauth2/default`
+- Entra ID: `https://login.microsoftonline.com/{tenant}/v2.0`
+- Custom: `https://auth.phonepe.com`
+
+MDS derives the JWKS URL from the issuer to fetch the public key for signature verification.
 
 ---
 
@@ -84,7 +112,6 @@ MDS extracts the `customer_id` from the issuer URL to look up:
 | Scope | Permission |
 |-------|------------|
 | `models:read` | Download models |
-| `models:write` | Upload models |
 | `models:delete` | Delete models |
 | `models:admin` | Full access |
 
@@ -175,7 +202,7 @@ Example JWKS response:
 |----------|-------------------|
 | **RFC 7519** (JWT) | ✅ Fully compliant |
 | **RFC 7515** (JWS) | ✅ RS256 signatures |
-| **RFC 7517** (JWK) | ⏳ JWKS planned |
+| **RFC 7517** (JWK) | ✅ JWKS with 1hr cache + stale fallback |
 | **OpenID Connect** | 🔄 Partial (not full OIDC) |
 | **OAuth 2.0** | 🔄 Partial (token format only) |
 

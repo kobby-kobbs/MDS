@@ -9,6 +9,7 @@ Required environment variables:
 
 import logging
 import os
+import threading
 from datetime import datetime, timedelta, timezone
 
 from azure.ai.ml import MLClient
@@ -16,9 +17,7 @@ from azure.identity import DefaultAzureCredential
 from azure.storage.blob import (
     BlobSasPermissions,
     BlobServiceClient,
-    ContainerSasPermissions,
     generate_blob_sas,
-    generate_container_sas,
 )
 
 log = logging.getLogger("mds")
@@ -32,6 +31,10 @@ STORAGE_CONTAINER = os.environ.get("STORAGE_CONTAINER", "models")
 # Client caches (keyed by registry/account name for multi-tenant)
 _ml_clients: dict[str, MLClient] = {}
 _blob_clients: dict[str, BlobServiceClient] = {}
+_clients_lock = threading.Lock()
+
+# Delegation key cache: { account: (key, expiry_datetime) }
+_delegation_cache: dict[str, tuple] = {}
 
 
 def get_ml_client(registry_name: str | None = None) -> MLClient:
@@ -41,10 +44,11 @@ def get_ml_client(registry_name: str | None = None) -> MLClient:
         registry_name: Override registry. Defaults to REGISTRY_NAME.
     """
     name = registry_name or REGISTRY_NAME
-    if name not in _ml_clients:
-        _ml_clients[name] = MLClient(credential=DefaultAzureCredential(), registry_name=name)
-        log.info(f"Connected to registry: {name}")
-    return _ml_clients[name]
+    with _clients_lock:
+        if name not in _ml_clients:
+            _ml_clients[name] = MLClient(credential=DefaultAzureCredential(), registry_name=name)
+            log.info(f"Connected to registry: {name}")
+        return _ml_clients[name]
 
 
 def get_blob_client(storage_account: str | None = None) -> BlobServiceClient:
@@ -54,34 +58,14 @@ def get_blob_client(storage_account: str | None = None) -> BlobServiceClient:
         storage_account: Override account. Defaults to STORAGE_ACCOUNT.
     """
     acct = storage_account or STORAGE_ACCOUNT
-    if acct not in _blob_clients:
-        _blob_clients[acct] = BlobServiceClient(
-            f"https://{acct}.blob.core.windows.net",
-            DefaultAzureCredential(),
-        )
-        log.info(f"Connected to storage: {acct}")
-    return _blob_clients[acct]
-
-
-def upload_to_blob(
-    content: bytes,
-    blob_name: str,
-    *,
-    storage_account: str | None = None,
-) -> str:
-    """Upload file to blob storage, returns URL."""
-    acct = storage_account or STORAGE_ACCOUNT
-    container = get_blob_client(acct).get_container_client(STORAGE_CONTAINER)
-    try:
-        container.create_container()
-    except Exception:
-        pass  # Already exists
-    container.get_blob_client(blob_name).upload_blob(
-        content, overwrite=True, max_concurrency=4,
-        max_single_put_size=8 * 1024 * 1024,    # use block upload above 8 MB
-        chunk_size=4 * 1024 * 1024,              # 4 MB blocks for parallel upload
-    )
-    return f"https://{acct}.blob.core.windows.net/{STORAGE_CONTAINER}/{blob_name}"
+    with _clients_lock:
+        if acct not in _blob_clients:
+            _blob_clients[acct] = BlobServiceClient(
+                f"https://{acct}.blob.core.windows.net",
+                DefaultAzureCredential(),
+            )
+            log.info(f"Connected to storage: {acct}")
+        return _blob_clients[acct]
 
 
 def generate_sas_url(
@@ -93,10 +77,22 @@ def generate_sas_url(
     """Generate a time-limited SAS download URL."""
     acct = storage_account or STORAGE_ACCOUNT
     client = get_blob_client(acct)
-    start = datetime.now(timezone.utc)
-    expiry = start + timedelta(hours=hours)
+    now = datetime.now(timezone.utc)
+    expiry = now + timedelta(hours=hours)
 
-    key = client.get_user_delegation_key(start, expiry)
+    # Use cached delegation key if still valid
+    with _clients_lock:
+        cached = _delegation_cache.get(acct)
+        if cached and cached[1] > now:
+            key = cached[0]
+        else:
+            key = None
+
+    if not key:
+        key = client.get_user_delegation_key(now, expiry)
+        with _clients_lock:
+            _delegation_cache[acct] = (key, now + timedelta(minutes=50))
+
     sas = generate_blob_sas(
         acct,
         STORAGE_CONTAINER,
@@ -104,41 +100,9 @@ def generate_sas_url(
         user_delegation_key=key,
         permission=BlobSasPermissions(read=True),
         expiry=expiry,
-        start=start,
+        start=now,
     )
     return f"https://{acct}.blob.core.windows.net/{STORAGE_CONTAINER}/{blob_name}?{sas}"
-
-
-def generate_upload_sas_url(
-    blob_prefix: str,
-    hours: int = 4,
-    *,
-    storage_account: str | None = None,
-) -> str:
-    """Generate a time-limited *container*-level SAS URL with write+create permissions.
-
-    Returns a URL of the form:
-        https://<acct>.blob.core.windows.net/<container>/<blob_prefix>?<container_sas>
-
-    Because the SAS is scoped to the **container** (not a single blob), the
-    client can PUT to any blob path under the prefix, e.g.
-        <url_base>/<filename>?<sas>
-    """
-    acct = storage_account or STORAGE_ACCOUNT
-    client = get_blob_client(acct)
-    start = datetime.now(timezone.utc)
-    expiry = start + timedelta(hours=hours)
-
-    key = client.get_user_delegation_key(start, expiry)
-    sas = generate_container_sas(
-        acct,
-        STORAGE_CONTAINER,
-        user_delegation_key=key,
-        permission=ContainerSasPermissions(read=True, write=True, create=True, list=True),
-        expiry=expiry,
-        start=start,
-    )
-    return f"https://{acct}.blob.core.windows.net/{STORAGE_CONTAINER}/{blob_prefix}?{sas}"
 
 
 def list_blobs(prefix: str, *, storage_account: str | None = None) -> list[str]:

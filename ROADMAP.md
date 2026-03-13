@@ -9,8 +9,8 @@ Transform MDS from a demo into a **paid, production-ready service** that provide
 
 ---
 
-## Immediate Milestone: Stage New Models in Private Catalog
-**Goal**: PhonePe (or any customer) can upload models to their private catalog with zero friction.
+## Immediate Milestone: Foundry Local Private Catalog
+**Goal**: PhonePe (or any customer) can discover and download private models via Foundry Local.
 
 ---
 
@@ -23,8 +23,6 @@ Transform MDS from a demo into a **paid, production-ready service** that provide
 - [x] **POST /catalog** — Foundry Local SDK compatible catalog endpoint (indexEntitiesResponse format)
 - [x] **GET /models/{name}** — Single model detail in Foundry Local format
 - [x] **Catalog Schema Aligned** — Tags match public catalog (qwen2.5 reference): alias, task, inputModalities, outputModalities, promptTemplate, license, directoryPath, foundryLocal, maxOutputTokens, supportsToolCalling, tool* fields
-- [x] **Upload Accepts FL Metadata** — /upload Form fields for all Foundry Local tag fields
-- [x] **Metadata Auto-Extraction** — ONNX model files auto-populate tags (task, modalities, modelType, fileSize) on upload
 - [x] **Test Harness** — Unit tests (auth, catalog, jwks, customers, API endpoints) + integration smoke tests
 - [x] **Project Structure** — src/mds/ package, tests/unit + tests/integration, pyproject.toml, .gitignore
 
@@ -64,8 +62,6 @@ Transform MDS from a demo into a **paid, production-ready service** that provide
 - [ ] **Download Flow Validation** — Confirm SDK receives SAS URL from MDS and downloads model binary directly from Blob Storage
 
 #### Metadata Automation (Future Enhancement)
-- [ ] **Deep ONNX Introspection** — Parse full ONNX graph to extract operator names, input/output tensor shapes, opset version
-- [ ] **Model Card Auto-Generation** — Generate Hugging Face-style model card from ONNX metadata + upload tags
 - [ ] **Tag Inheritance from Public Catalog** — If model is derived from a public catalog model, inherit base tags automatically
 
 #### Customer App Integration
@@ -130,7 +126,7 @@ Transform MDS from a demo into a **paid, production-ready service** that provide
    - Fix: Use ML registry for metadata only
    
 2. **Hardcoded Keys**: RSA keys in `customers.py`
-   - Fix: JWKS endpoint fetching
+   - Fix: ✅ JWKS endpoint fetching (implemented)
    
 3. **No Rate Limiting**: API can be abused
    - Fix: Add per-customer rate limits
@@ -199,9 +195,8 @@ Customer uploads: fraud-model-v1.onnx (FP32, 50MB)
 
 ### Emmanuel
 1. [ ] Create customer onboarding Bicep/Terraform script
-2. [ ] Create simple model upload script for customers
-3. [ ] Fix double-storage issue (ML registry metadata only)
-4. [ ] Document JWT token fields with industry comparison
+2. [ ] Fix double-storage issue (ML registry metadata only)
+3. [ ] Document JWT token fields with industry comparison
 
 ### Manager
 1. [ ] Get production subscriptions from X Carell
@@ -225,7 +220,6 @@ Customer uploads: fraud-model-v1.onnx (FP32, 50MB)
 | Metric | Target |
 |--------|--------|
 | Customer onboarding time | < 1 hour (scripted) |
-| Model upload time | < 5 minutes for 100MB model |
 | Download latency | < 2 seconds to get SAS URL |
 | Optimization time | < 10 minutes per variant |
 | Uptime | 99.9% |

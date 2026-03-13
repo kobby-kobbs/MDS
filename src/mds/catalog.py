@@ -6,11 +6,11 @@ import base64
 import json
 from typing import List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class IndexEntitiesRequest(BaseModel):
-    pageSize: Optional[int] = 100
+    pageSize: Optional[int] = Field(default=100, le=500)
     skip: Optional[int] = None
     continuationToken: Optional[str] = None
 
@@ -23,15 +23,6 @@ class ResourceId(BaseModel):
 class CatalogRequest(BaseModel):
     resourceIds: Optional[List[ResourceId]] = []
     indexEntitiesRequest: Optional[IndexEntitiesRequest] = None
-
-
-class FLCatalogQuery(BaseModel):
-    """Query parameters for the /catalog/fl endpoint."""
-    task: Optional[str] = None          # filter by task (chat-completion, text-generation, etc.)
-    device: Optional[str] = None        # filter by device (cpu, npu, gpu)
-    modality: Optional[str] = None      # filter by inputModalities
-    pageSize: Optional[int] = 50
-    continuationToken: Optional[str] = None
 
 
 # Pagination helpers
@@ -66,7 +57,7 @@ def build_foundry_model(model_info, tags: dict, *, registry_name: str = "") -> d
     # Core annotation tags (always present, matching FL reference exactly)
     annotation_tags: dict = {
         "alias": tags.get("alias", model_info.name),
-        "author": tags.get("author", tags.get("uploaded_by", "unknown")),
+        "author": tags.get("author", "unknown"),
         "directoryPath": tags.get("directoryPath", model_info.name),
         "disable-maap": tags.get("disable-maap", "True"),
         "foundryLocal": tags.get("foundryLocal", "true"),
