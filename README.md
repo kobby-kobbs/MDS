@@ -24,8 +24,9 @@ MDS/
 │   └── integration/       # End-to-end smoke tests (requires running server)
 ├── docs/
 │   ├── JWT_SPECIFICATION.md
-│   ├── SDK_INTEGRATION.md # How to point Foundry Local SDK at MDS
-│   └── CUSTOMER_ONBOARDING.md
+│   ├── SDK_INTEGRATION.md # How MDS works as alternate catalog
+│   ├── CUSTOMER_ONBOARDING.md
+│   └── PRIVATE_CATALOG_GUIDE.md # Customer integration guide (start here)
 ├── infrastructure/
 │   ├── onboard.bicep      # Customer onboarding ARM template
 │   └── onboard.ps1        # Customer onboarding script
@@ -70,25 +71,27 @@ uvicorn main:app --reload --port 8000
 
 ## SDK Integration
 
-The Foundry Local SDK can use MDS as a private catalog. Configure via `PrivateCatalogUri`:
+The Foundry Local SDK supports private catalogs alongside the public catalog.
 
-```json
-{
-    "PrivateCatalogUri": "https://mds-model-distribution.azurewebsites.net",
-    "PrivateCatalogClientId": "phonepe",
-    "PrivateCatalogClientSecret": "<secret>"
-}
+**Recommended: Auto-connect** — set env vars or config, no code changes needed:
+
+```bash
+# Set credentials (env vars, K8s secrets, or appsettings.json)
+export MDS_URI="https://mds-model-distribution.azurewebsites.net"
+export MDS_CLIENT_ID="your-client-id"
+export MDS_CLIENT_SECRET="your-client-secret"
+export MDS_TOKEN_ENDPOINT="https://your-idp.com/oauth/token"
+export MDS_AUDIENCE="model-distribution-service"
 ```
 
-Or use the API-key-in-URL approach (no client credentials needed):
-
-```json
-{
-    "AzureCatalogUri": "https://mds-model-distribution.azurewebsites.net/catalog/foundrylocal/<api-key>"
-}
+```csharp
+// Same code as before — private models appear automatically
+await FoundryLocalManager.CreateAsync(config);
+var catalog = await mgr.GetCatalogAsync();
+var models = await catalog.ListModelsAsync();  // public + private
 ```
 
-See [`docs/SDK_INTEGRATION.md`](docs/SDK_INTEGRATION.md) for full integration guide.
+See [`docs/PRIVATE_CATALOG_GUIDE.md`](docs/PRIVATE_CATALOG_GUIDE.md) for the full integration guide.
 
 ## Running Tests
 
